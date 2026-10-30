@@ -17,6 +17,7 @@ from core.utils.array_types import (
 )
 from core.data_structs.composite_spectrum import CompositeSpectrum
 from core.utils.config import get_saturation_threshold
+from core.utils.sparse_reads import csr_row_dense
 from core.utils.formula_formatting import format_formula_obj_to_html
 from core.utils.spectra import merge_spectra, normalize_spectrum
 
@@ -147,9 +148,7 @@ class Ensemble:
 
             s0 = int(scan_idxs[0])
             s1 = int(scan_idxs[-1])
-            intsys = ms1_scan_array.intsy_arr[
-                cofeature.mz_lane_idx, s0:s1 + 1
-            ].toarray().flatten()
+            intsys = csr_row_dense(ms1_scan_array.intsy_arr, cofeature.mz_lane_idx, s0, s1 + 1)
             if intsys.size == 0:
                 continue
 

@@ -1,11 +1,12 @@
 """
 Central data registry for performing UUID <-> object look-ups.
 
-Dependent on PyQt5 for signals/slots, but should not otherwise involve
-any Qt.
+Uses PyQt5 for signals/slots when it is installed (the `gui` dependency
+group), else plain-Python signals with the same connect/emit API; should not
+otherwise involve any Qt.
 """
 
-from PyQt5 import QtCore
+from core.utils.signals import QObject, pyqtSignal
 
 from core.interfaces.data_sources import SampleDataSource
 
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
     from core.data_structs.similarity_matrix import SimilarityMatrix
 
 class DataRegistry(
-    QtCore.QObject,
+    QObject,
     # NOTE: don't inherit SampleDataSource here.
     # Because it's a typing.Protocol, mixing it w/ QObject
     # raises a metaclass conflict
@@ -40,52 +41,52 @@ class DataRegistry(
 
     # TODO: Implement global Ensemble searching here
     """
-    sigSampleAdded = QtCore.pyqtSignal(
+    sigSampleAdded = pyqtSignal(
         object  # Sample
     )
-    sigSampleRemoved = QtCore.pyqtSignal(
+    sigSampleRemoved = pyqtSignal(
         object  # Sample
     )
-    sigSampleUpdated = QtCore.pyqtSignal(
+    sigSampleUpdated = pyqtSignal(
         object  # Sample
     )
-    sigAlignmentAdded = QtCore.pyqtSignal(
+    sigAlignmentAdded = pyqtSignal(
         object  # EnsembleAlignment
     )
-    sigAlignmentRemoved = QtCore.pyqtSignal(
+    sigAlignmentRemoved = pyqtSignal(
         object  # EnsembleAlignment
     )
-    sigAssignmentAdded = QtCore.pyqtSignal(
+    sigAssignmentAdded = pyqtSignal(
         object  # FormulaAssignment
     )
-    sigAssignmentRemoved = QtCore.pyqtSignal(
+    sigAssignmentRemoved = pyqtSignal(
         object  # FormulaAssignment
     )
-    sigAssignmentUpdated = QtCore.pyqtSignal(
+    sigAssignmentUpdated = pyqtSignal(
         object  # FormulaAssignment (e.g. its chosen candidate changed)
     )
-    sigGroupAdded = QtCore.pyqtSignal(
+    sigGroupAdded = pyqtSignal(
         object  # AnalyteGroup
     )
-    sigGroupRemoved = QtCore.pyqtSignal(
+    sigGroupRemoved = pyqtSignal(
         object  # AnalyteGroup
     )
-    sigGroupUpdated = QtCore.pyqtSignal(
+    sigGroupUpdated = pyqtSignal(
         object  # AnalyteGroup (edited in place: title, notes, membership)
     )
-    sigAnnotationAdded = QtCore.pyqtSignal(
+    sigAnnotationAdded = pyqtSignal(
         object  # AnalyteAnnotation
     )
-    sigAnnotationRemoved = QtCore.pyqtSignal(
+    sigAnnotationRemoved = pyqtSignal(
         object  # AnalyteAnnotation
     )
-    sigAnnotationUpdated = QtCore.pyqtSignal(
+    sigAnnotationUpdated = pyqtSignal(
         object  # AnalyteAnnotation (replaced one for the same analyte)
     )
-    sigMatrixAdded = QtCore.pyqtSignal(
+    sigMatrixAdded = pyqtSignal(
         object  # SimilarityMatrix
     )
-    sigMatrixRemoved = QtCore.pyqtSignal(
+    sigMatrixRemoved = pyqtSignal(
         object  # SimilarityMatrix
     )
 

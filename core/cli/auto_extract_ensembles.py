@@ -36,6 +36,7 @@ from typing import Literal, Optional, TYPE_CHECKING
 import numpy as np
 
 from core.data_structs import Ensemble
+from core.utils.sparse_reads import csc_col_entries, csr_row_dense, csr_rows_dense
 from core.cli.find_cofeatures import (
     _find_nonzero_mass_lanes,
     _calculate_cofeature_scores,
@@ -716,20 +717,6 @@ class SeedProvider:
         raise NotImplementedError
 
 
-def _csr_row(arr, row: int) -> np.ndarray:
-    """
-    Dense copy of one row of a CSR array, read straight from its index
-    arrays. Same result as ``arr[row].toarray().flatten()`` without scipy's
-    per-call indexing overhead (this runs once per seed and lane update).
-    """
-    if not arr.has_canonical_format:
-        return arr[row].toarray().flatten()
-    out = np.zeros(arr.shape[1], dtype=arr.dtype)
-    start, end = arr.indptr[row], arr.indptr[row + 1]
-    out[arr.indices[start:end]] = arr.data[start:end]
-    return out
-
-
 class LaneMaxSeedProvider(SeedProvider):
     """
     DIA / auto seeding: greedily pick the tallest signal across all MS1 lanes,
@@ -810,7 +797,7 @@ class LaneMaxSeedProvider(SeedProvider):
         )
 
     def _lane_chrom(self, lane: int) -> np.ndarray:
-        chrom = _csr_row(self.scan_array.intsy_arr, lane)
+        chrom = csr_row_dense(self.scan_array.intsy_arr, lane)
         if self.rt_mask is not None:
             chrom[self.rt_mask] = 0
         for start, end in self.assigned_ranges.get(lane, []):
@@ -848,7 +835,7 @@ class LaneMaxSeedProvider(SeedProvider):
         # Raw lane signal (no consumption zeroing) for a truthful prominence
         # baseline. RT masking is deliberately NOT applied — the chemical
         # background outside the RT window is still real baseline.
-        return _csr_row(self.scan_array.intsy_arr, seed.lane)
+        return csr_row_dense(self.scan_array.intsy_arr, seed.lane)
 
     def window_intensity(
         self,
@@ -859,9 +846,7 @@ class LaneMaxSeedProvider(SeedProvider):
         # Raw slice, with regions already claimed by earlier ensembles zeroed so
         # they can't be recruited again. This is what enforces "one signal
         # belongs to at most one ensemble" at recruitment time.
-        grid = self.scan_array.intsy_arr[
-            lane_idxs, scan_start:scan_end
-        ].toarray()
+        grid = csr_rows_dense(self.scan_array.intsy_arr, lane_idxs, scan_start, scan_end)
         for i, lane in enumerate(lane_idxs):
             ranges = self.assigned_ranges.get(int(lane))
             if not ranges:
@@ -1005,11 +990,11 @@ class PrecursorSeedProvider(SeedProvider):
         return None
 
     def seed_chrom(self, seed: Seed) -> np.ndarray:
-        return self.ms1.intsy_arr[seed.lane].toarray().flatten()
+        return csr_row_dense(self.ms1.intsy_arr, seed.lane)
 
     def raw_seed_chrom(self, seed: Seed) -> np.ndarray:
         # Precursor seeding never zeroes lanes, so raw == working here.
-        return self.ms1.intsy_arr[seed.lane].toarray().flatten()
+        return csr_row_dense(self.ms1.intsy_arr, seed.lane)
 
     def window_intensity(
         self,
@@ -1020,7 +1005,7 @@ class PrecursorSeedProvider(SeedProvider):
         # Precursor grouping assigns whole precursor features (via `assigned`),
         # not lane regions, and candidates are already assignment-gated, so
         # recruitment reads the raw signal.
-        return self.ms1.intsy_arr[lane_idxs, scan_start:scan_end].toarray()
+        return csr_rows_dense(self.ms1.intsy_arr, lane_idxs, scan_start, scan_end)
 
     def candidates_in_window(
         self, seed, seg_start, seg_end, window_idxs, config,
@@ -1136,7 +1121,7 @@ def _build_precursor_features(
 
     features: list[PrecursorFeature] = []
     for lane, cols_dict in lane_to_cols.items():
-        chrom = ms1.intsy_arr[lane].toarray().flatten()
+        chrom = csr_row_dense(ms1.intsy_arr, lane)
         features.extend(_cluster_lane_into_features(ms1, lane, chrom, cols_dict))
     return features
 
@@ -1193,13 +1178,19 @@ def _tallest_lane_in_window(
     Row (mass lane) of the tallest MS1 signal inside [lo, hi] at ``ms1_col``, or
     None if the window is empty.
     """
-    mzs = ms1.mz_arr_csc._getcol(ms1_col).toarray().flatten()
-    intsys = ms1.intsy_arr_csc._getcol(ms1_col).toarray().flatten()
+    # Only stored entries can pass (an unstored lane reads m/z 0); both arrays
+    # share one sparsity pattern, so their column entries line up.
+    lanes, mzs = csc_col_entries(ms1.mz_arr_csc, ms1_col)
+    intsy_lanes, intsys = csc_col_entries(ms1.intsy_arr_csc, ms1_col)
+    if not np.array_equal(lanes, intsy_lanes):
+        mzs = ms1.mz_arr_csc._getcol(ms1_col).toarray().flatten()
+        intsys = ms1.intsy_arr_csc._getcol(ms1_col).toarray().flatten()
+        lanes = np.arange(mzs.size)
     mask = (mzs >= lo) & (mzs <= hi) & (intsys > min_intsy)
     rows = np.where(mask)[0]
     if rows.size == 0:
         return None
-    return int(rows[np.argmax(intsys[rows])])
+    return int(lanes[rows[np.argmax(intsys[rows])]])
 
 
 def _climb_to_apex(chrom: np.ndarray, col: int) -> int:

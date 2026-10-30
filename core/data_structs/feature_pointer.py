@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from core.utils.array_types import to_chrom_arr
+from core.utils.sparse_reads import csr_row_dense
 
 if TYPE_CHECKING:
     from core.data_structs.scan_array import ScanArray
@@ -91,7 +92,7 @@ class FeaturePointer:
 
         # Densify only the spanned range, then pick the (possibly sparse) scans
         s0, s1 = self.scan_start, self.scan_end
-        row = lane_arr[self.mz_lane_idx, s0:s1 + 1].toarray().flatten()
+        row = csr_row_dense(lane_arr, self.mz_lane_idx, s0, s1 + 1)
         return row[self.scan_idxs - s0]
 
     def get_chrom_array(

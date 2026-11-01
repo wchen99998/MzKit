@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional, TYPE_CHECKING
 
 import numpy as np
+from scipy.sparse import csc_array, csr_array
 
 from core.data_structs import Ensemble
 from core.utils.sparse_reads import csc_col_entries, csc_rows_dense, csr_row_dense, csr_rows_dense
@@ -732,11 +733,8 @@ class LaneMaxSeedProvider(SeedProvider):
         self.n_scans = self.scan_array.intsy_arr.shape[1]
 
         self.assigned_ranges: dict[int, list[tuple[int, int]]] = defaultdict(list)
-        self._has_ranges = np.zeros(self.scan_array.intsy_arr.shape[0], dtype=bool)  # lanes in assigned_ranges
         self._seed_chrom_cache: dict[int, np.ndarray] = {}
-        # The CSC copy reads a window of scans without walking whole lanes; only when it matches the CSR array
-        csc = self.scan_array.intsy_arr_csc
-        self._intsy_csc = csc if csc is not None and csc.nnz == self.scan_array.intsy_arr.nnz else None
+        self._init_working_copies()
 
         # Optional RT restriction: mask scans outside the range everywhere.
         self.rt_mask: Optional[np.ndarray] = None
@@ -807,12 +805,69 @@ class LaneMaxSeedProvider(SeedProvider):
             .flatten()
         )
 
+    def _init_working_copies(self) -> None:
+        # Working copies of the intensities in which consumed signal is zeroed as it is claimed (_consume; the
+        # claims are also kept in assigned_ranges). Reads then need no per-range zeroing, a window of scans comes
+        # from the CSC copy without walking whole lanes, and a lane's remaining max or apex comes from its stored
+        # entries instead of a dense chromatogram over the whole run.
+        csr = self.scan_array.intsy_arr
+        self._work = csr_array((csr.data.copy(), csr.indices, csr.indptr), shape=csr.shape)
+        self._sorted = csr.format == 'csr' and csr.has_canonical_format
+        csc = self.scan_array.intsy_arr_csc
+        self._work_csc = None
+        if csc is not None and csc.format == 'csc' and csc.has_canonical_format and csc.nnz == csr.nnz:
+            self._work_csc = csc_array((csc.data.copy(), csc.indices, csc.indptr), shape=csc.shape)
+            # (scan, lane) of every CSC entry as one sorted key, to find a lane's entries in a range of scans
+            self._csc_keys = (np.repeat(np.arange(csc.shape[1], dtype=np.int64), np.diff(csc.indptr)) * csc.shape[0]
+                              + csc.indices)
+
+    def _consume(self, lane: int, start: int, end: int) -> None:
+        """Claim scans [start, end) of a lane: record the range and zero those entries in the working copies."""
+        self.assigned_ranges[lane].append((start, end))
+        start, end = max(start, 0), min(end, self.n_scans)
+        if end <= start:
+            return
+        lo, hi = self._work.indptr[lane], self._work.indptr[lane + 1]
+        cols = self._work.indices[lo:hi]
+        if self._sorted:
+            self._work.data[lo + np.searchsorted(cols, start):lo + np.searchsorted(cols, end)] = 0
+        else:
+            self._work.data[lo:hi][(cols >= start) & (cols < end)] = 0
+        if self._work_csc is not None:
+            keys = np.arange(start, end, dtype=np.int64) * self._work_csc.shape[0] + lane
+            pos = np.minimum(np.searchsorted(self._csc_keys, keys), self._csc_keys.size - 1)
+            self._work_csc.data[pos[self._csc_keys[pos] == keys]] = 0
+
+    def _lane_entries(self, lane: int) -> tuple[np.ndarray, np.ndarray]:
+        # Stored (scans, remaining intensities) of a lane, outside rt_mask
+        lo, hi = self._work.indptr[lane], self._work.indptr[lane + 1]
+        cols, vals = self._work.indices[lo:hi], self._work.data[lo:hi]
+        if self.rt_mask is not None:
+            keep = ~self.rt_mask[cols]
+            cols, vals = cols[keep], vals[keep]
+        return cols, vals
+
+    def _lane_max(self, lane: int) -> float:
+        # _lane_chrom(lane).max() from the stored entries: the scans with no entry are zeros
+        cols, vals = self._lane_entries(lane)
+        top = float(vals.max()) if vals.size else 0.0
+        return max(top, 0.0) if vals.size < self.n_scans else top
+
+    def _lane_apex(self, lane: int) -> tuple[int, float]:
+        # (np.argmax(chrom), chrom.max()) of _lane_chrom(lane) when that max is above 0; (0, 0.0) otherwise
+        cols, vals = self._lane_entries(lane)
+        if not self._sorted:
+            order = np.argsort(cols, kind='stable')
+            cols, vals = cols[order], vals[order]
+        if not vals.size or vals.max() <= 0:
+            return 0, 0.0
+        k = int(np.argmax(vals))
+        return int(cols[k]), float(vals[k])
+
     def _lane_chrom(self, lane: int) -> np.ndarray:
-        chrom = csr_row_dense(self.scan_array.intsy_arr, lane)
+        chrom = csr_row_dense(self._work, lane)
         if self.rt_mask is not None:
             chrom[self.rt_mask] = 0
-        for start, end in self.assigned_ranges.get(lane, []):
-            chrom[start:end] = 0
         return chrom
 
     def _tallest_lane(self) -> int:
@@ -830,13 +885,13 @@ class LaneMaxSeedProvider(SeedProvider):
             if self.lane_max_intsy[lane] < self.config.parent_threshold:
                 return None
 
-            chrom = self._lane_chrom(lane)
-            apex = int(np.argmax(chrom))
-            if chrom[apex] < self.config.parent_threshold:
+            apex, apex_intsy = self._lane_apex(lane)
+            if apex_intsy < self.config.parent_threshold:
                 # Stale tracker entry; retire this lane and keep looking.
                 self.lane_max_intsy[lane] = 0
                 continue
 
+            chrom = self._lane_chrom(lane)
             self._seed_chrom_cache[lane] = chrom
             return Seed(
                 lane=lane,
@@ -867,18 +922,10 @@ class LaneMaxSeedProvider(SeedProvider):
         # they can't be recruited again. This is what enforces "one signal
         # belongs to at most one ensemble" at recruitment time.
         grid = None
-        if self._intsy_csc is not None:
-            grid = csc_rows_dense(self._intsy_csc, lane_idxs, scan_start, scan_end)
+        if self._work_csc is not None:
+            grid = csc_rows_dense(self._work_csc, lane_idxs, scan_start, scan_end)
         if grid is None:
-            grid = csr_rows_dense(self.scan_array.intsy_arr, lane_idxs, scan_start, scan_end)
-        lane_idxs = np.asarray(lane_idxs, dtype=np.int64)
-        for i in np.flatnonzero(self._has_ranges[lane_idxs]).tolist():
-            ranges = self.assigned_ranges[int(lane_idxs[i])]
-            for a_start, a_end in ranges:
-                lo = max(a_start, scan_start)
-                hi = min(a_end, scan_end)
-                if hi > lo:
-                    grid[i, lo - scan_start:hi - scan_start] = 0
+            grid = csr_rows_dense(self._work, lane_idxs, scan_start, scan_end)
         return grid
 
     def candidates_in_window(
@@ -921,8 +968,7 @@ class LaneMaxSeedProvider(SeedProvider):
             c_start, c_end = self._cofeature_peak_bounds(
                 lane, ftr.scan_start, ftr.scan_end
             )
-            self.assigned_ranges[lane].append((c_start, c_end))
-            self._has_ranges[lane] = True
+            self._consume(lane, c_start, c_end)
             affected.add(lane)
         self._recompute_lane_max(affected)
 
@@ -950,8 +996,7 @@ class LaneMaxSeedProvider(SeedProvider):
         )
 
     def _zero_region(self, lane: int, seg_start: int, seg_end: int) -> None:
-        self.assigned_ranges[lane].append((seg_start, seg_end))
-        self._has_ranges[lane] = True
+        self._consume(lane, seg_start, seg_end)
         self._recompute_lane_max({lane})
 
     def _recompute_lane_max(self, lanes: set[int]) -> None:
@@ -962,8 +1007,7 @@ class LaneMaxSeedProvider(SeedProvider):
             if self.persistent_lane_mask[lane]:
                 self.lane_max_intsy[lane] = 0.0
                 continue
-            chrom = self._lane_chrom(lane)
-            self.lane_max_intsy[lane] = chrom.max()
+            self.lane_max_intsy[lane] = self._lane_max(lane)
             if self.lane_max_intsy[lane] > 0:
                 heapq.heappush(self._lane_heap, (-float(self.lane_max_intsy[lane]), lane))
 

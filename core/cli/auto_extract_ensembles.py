@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional, TYPE_CHECKING
 
 import numpy as np
-from scipy.sparse import csc_array, csr_array
+from scipy.sparse import csr_array
 
 from core.data_structs import Ensemble
 from core.utils.sparse_reads import csc_col_entries, csc_rows_dense, csr_row_dense, csr_rows_dense
@@ -734,7 +734,6 @@ class LaneMaxSeedProvider(SeedProvider):
 
         self.assigned_ranges: dict[int, list[tuple[int, int]]] = defaultdict(list)
         self._seed_chrom_cache: dict[int, np.ndarray] = {}
-        self._init_working_copies()
 
         # Optional RT restriction: mask scans outside the range everywhere.
         self.rt_mask: Optional[np.ndarray] = None
@@ -749,6 +748,9 @@ class LaneMaxSeedProvider(SeedProvider):
         # _recompute_lane_max, which both hold these at zero max).
         self.persistent_lane_mask = self._compute_persistent_lanes()
 
+        # Working copies of the raw matrix (made canonical first, see _init_working_copies); every read below
+        # and in the methods goes through them, except raw_seed_chrom.
+        self._init_working_copies()
         self.lane_max_intsy = self._initial_lane_max()
         self.lane_max_intsy[self.persistent_lane_mask] = 0.0
         # Max-heap of (-lane max, lane) so next_seed finds the tallest lane without scanning every lane per seed.
@@ -792,14 +794,16 @@ class LaneMaxSeedProvider(SeedProvider):
         return (present_counts / n_scans) > frac
 
     def _initial_lane_max(self) -> np.ndarray:
+        # Per-lane max of the working copy (NaN entries are zero there, so a lane of NaN has max 0); scans under
+        # rt_mask do not count.
         if self.rt_mask is None:
-            return self.scan_array.intsy_arr.max(axis=1).toarray().flatten()
+            return self._work.max(axis=1).toarray().flatten()
         allowed = ~self.rt_mask
         if not allowed.any():
-            return np.zeros(self.scan_array.intsy_arr.shape[0])
+            return np.zeros(self._work.shape[0])
         allowed_idxs = np.where(allowed)[0]
         return (
-            self.scan_array.intsy_arr[:, allowed_idxs[0]:allowed_idxs[-1] + 1]
+            self._work[:, allowed_idxs[0]:allowed_idxs[-1] + 1]
             .max(axis=1)
             .toarray()
             .flatten()
@@ -810,16 +814,27 @@ class LaneMaxSeedProvider(SeedProvider):
         # claims are also kept in assigned_ranges). Reads then need no per-range zeroing, a window of scans comes
         # from the CSC copy without walking whole lanes, and a lane's remaining max or apex comes from its stored
         # entries instead of a dense chromatogram over the whole run.
+        #
+        # Both copies own all three of their arrays and are canonical (indices sorted, no duplicates, as
+        # ScanArray.__post_init__ leaves intsy_arr). The CSC copy is the transpose of the CSR copy, built from it
+        # here rather than taken from scan_array.intsy_arr_csc, so window reads cannot disagree with lane reads.
+        # NaN intensities are no signal: they are zeroed in the copies, so they never seed, set a lane max or
+        # get recruited; raw_seed_chrom alone returns the raw lane as stored.
         csr = self.scan_array.intsy_arr
-        self._work = csr_array((csr.data.copy(), csr.indices, csr.indptr), shape=csr.shape)
-        self._sorted = csr.format == 'csr' and csr.has_canonical_format
-        csc = self.scan_array.intsy_arr_csc
-        self._work_csc = None
-        if csc is not None and csc.format == 'csc' and csc.has_canonical_format and csc.nnz == csr.nnz:
-            self._work_csc = csc_array((csc.data.copy(), csc.indices, csc.indptr), shape=csc.shape)
-            # (scan, lane) of every CSC entry as one sorted key, to find a lane's entries in a range of scans
-            self._csc_keys = (np.repeat(np.arange(csc.shape[1], dtype=np.int64), np.diff(csc.indptr)) * csc.shape[0]
-                              + csc.indices)
+        if csr.format != 'csr':
+            raise TypeError(f'scan_array.intsy_arr must be a CSR array, got {csr.format!r}')
+        # No-op when already canonical; otherwise sorts the indices and merges duplicates in place, exactly as
+        # the argmax in ScanArray.__post_init__ does, so the raw matrix and the copies agree.
+        csr.sum_duplicates()
+        self._work = csr_array((csr.data.copy(), csr.indices.copy(), csr.indptr.copy()), shape=csr.shape)
+        self._work.data[np.isnan(self._work.data)] = 0
+        self._work_csc = self._work.tocsc()
+        if not self._work_csc.has_canonical_format:  # scipy marks the conversion sorted; never expected
+            self._work_csc.sum_duplicates()
+        # (scan, lane) of every CSC entry as one sorted key, to find a lane's entries in a range of scans
+        csc = self._work_csc
+        self._csc_keys = (np.repeat(np.arange(csc.shape[1], dtype=np.int64), np.diff(csc.indptr)) * csc.shape[0]
+                          + csc.indices)
 
     def _consume(self, lane: int, start: int, end: int) -> None:
         """Claim scans [start, end) of a lane: record the range and zero those entries in the working copies."""
@@ -829,14 +844,10 @@ class LaneMaxSeedProvider(SeedProvider):
             return
         lo, hi = self._work.indptr[lane], self._work.indptr[lane + 1]
         cols = self._work.indices[lo:hi]
-        if self._sorted:
-            self._work.data[lo + np.searchsorted(cols, start):lo + np.searchsorted(cols, end)] = 0
-        else:
-            self._work.data[lo:hi][(cols >= start) & (cols < end)] = 0
-        if self._work_csc is not None:
-            keys = np.arange(start, end, dtype=np.int64) * self._work_csc.shape[0] + lane
-            pos = np.minimum(np.searchsorted(self._csc_keys, keys), self._csc_keys.size - 1)
-            self._work_csc.data[pos[self._csc_keys[pos] == keys]] = 0
+        self._work.data[lo + np.searchsorted(cols, start):lo + np.searchsorted(cols, end)] = 0
+        keys = np.arange(start, end, dtype=np.int64) * self._work_csc.shape[0] + lane
+        pos = np.minimum(np.searchsorted(self._csc_keys, keys), self._csc_keys.size - 1)
+        self._work_csc.data[pos[self._csc_keys[pos] == keys]] = 0
 
     def _lane_entries(self, lane: int) -> tuple[np.ndarray, np.ndarray]:
         # Stored (scans, remaining intensities) of a lane, outside rt_mask
@@ -855,10 +866,7 @@ class LaneMaxSeedProvider(SeedProvider):
 
     def _lane_apex(self, lane: int) -> tuple[int, float]:
         # (np.argmax(chrom), chrom.max()) of _lane_chrom(lane) when that max is above 0; (0, 0.0) otherwise
-        cols, vals = self._lane_entries(lane)
-        if not self._sorted:
-            order = np.argsort(cols, kind='stable')
-            cols, vals = cols[order], vals[order]
+        cols, vals = self._lane_entries(lane)  # scans ascending: the copy is canonical
         if not vals.size or vals.max() <= 0:
             return 0, 0.0
         k = int(np.argmax(vals))
@@ -921,9 +929,10 @@ class LaneMaxSeedProvider(SeedProvider):
         # Raw slice, with regions already claimed by earlier ensembles zeroed so
         # they can't be recruited again. This is what enforces "one signal
         # belongs to at most one ensemble" at recruitment time.
-        grid = None
-        if self._work_csc is not None:
-            grid = csc_rows_dense(self._work_csc, lane_idxs, scan_start, scan_end)
+        # Read from the CSC working copy (the transpose of the CSR one, kept in step by _consume), which costs
+        # the window's entries rather than the lanes' full length; csc_rows_dense declines repeated lanes, and
+        # the CSR copy then gives the same grid.
+        grid = csc_rows_dense(self._work_csc, lane_idxs, scan_start, scan_end)
         if grid is None:
             grid = csr_rows_dense(self._work, lane_idxs, scan_start, scan_end)
         return grid

@@ -76,7 +76,10 @@ def csc_rows_dense(csc, rows: np.ndarray, start: int, stop: int) -> Optional[np.
 def csc_rows_above(csc, cols: np.ndarray, threshold: float) -> Optional[np.ndarray]:
     """Rows, ascending, whose max over columns ``cols`` exceeds ``threshold`` (``np.where(csc[:, cols].max(axis=1) >
     threshold)[0]`` for a threshold of 0 or more), from those columns' entries only, so the cost follows the window
-    rather than the number of rows. None when ``csc`` is not canonical CSC or the threshold is negative."""
+    rather than the number of rows. None when ``csc`` is not canonical CSC or the threshold is negative.
+
+    A NaN entry never clears the threshold here, whereas scipy's max would turn the row's max into NaN and drop
+    the row even when another entry in the window is above the threshold: NaN is read as no signal."""
     if csc.format != 'csc' or not csc.has_canonical_format or threshold < 0:
         return None
     cols = np.asarray(cols, dtype=np.int64)

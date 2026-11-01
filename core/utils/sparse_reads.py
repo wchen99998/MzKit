@@ -50,6 +50,29 @@ def csr_rows_dense(arr, rows: np.ndarray, start: int, stop: int) -> np.ndarray:
     return out
 
 
+def csc_rows_dense(csc, rows: np.ndarray, start: int, stop: int) -> Optional[np.ndarray]:
+    """``arr[rows, start:stop].toarray()`` from the canonical CSC copy ``csc`` of a CSR array ``arr``: reads only the
+    entries of columns start..stop-1, so the cost follows the window, not the rows' full length. None (use
+    csr_rows_dense) when ``csc`` is not canonical CSC or ``rows`` repeats a row."""
+    rows = np.asarray(rows, dtype=np.int64)
+    if csc.format != 'csc' or not csc.has_canonical_format:
+        return None
+    order = np.argsort(rows, kind='stable')
+    sorted_rows = rows[order]
+    if sorted_rows.size > 1 and (sorted_rows[1:] == sorted_rows[:-1]).any():
+        return None
+    out = np.zeros((rows.size, max(stop - start, 0)), dtype=csc.dtype)
+    a, b = csc.indptr[start], csc.indptr[max(stop, start)]
+    if rows.size == 0 or a == b:
+        return out
+    entry_rows = csc.indices[a:b]
+    entry_cols = np.repeat(np.arange(stop - start), np.diff(csc.indptr[start:stop + 1]))
+    pos = np.minimum(np.searchsorted(sorted_rows, entry_rows), rows.size - 1)
+    hit = sorted_rows[pos] == entry_rows
+    out[order[pos[hit]], entry_cols[hit]] = csc.data[a:b][hit]
+    return out
+
+
 def csc_col_entries(arr, col: int) -> tuple[np.ndarray, np.ndarray]:
     """Stored (row indices, values) of one column of a CSC array, rows ascending."""
     if arr.format != 'csc' or not arr.has_canonical_format:

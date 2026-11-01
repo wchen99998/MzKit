@@ -37,7 +37,7 @@ from typing import Literal, Optional, TYPE_CHECKING
 import numpy as np
 
 from core.data_structs import Ensemble
-from core.utils.sparse_reads import csc_col_entries, csr_row_dense, csr_rows_dense
+from core.utils.sparse_reads import csc_col_entries, csc_rows_dense, csr_row_dense, csr_rows_dense
 from core.cli.find_cofeatures import (
     _find_nonzero_mass_lanes,
     _calculate_cofeature_scores,
@@ -732,7 +732,11 @@ class LaneMaxSeedProvider(SeedProvider):
         self.n_scans = self.scan_array.intsy_arr.shape[1]
 
         self.assigned_ranges: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        self._has_ranges = np.zeros(self.scan_array.intsy_arr.shape[0], dtype=bool)  # lanes in assigned_ranges
         self._seed_chrom_cache: dict[int, np.ndarray] = {}
+        # The CSC copy reads a window of scans without walking whole lanes; only when it matches the CSR array
+        csc = self.scan_array.intsy_arr_csc
+        self._intsy_csc = csc if csc is not None and csc.nnz == self.scan_array.intsy_arr.nnz else None
 
         # Optional RT restriction: mask scans outside the range everywhere.
         self.rt_mask: Optional[np.ndarray] = None
@@ -862,11 +866,14 @@ class LaneMaxSeedProvider(SeedProvider):
         # Raw slice, with regions already claimed by earlier ensembles zeroed so
         # they can't be recruited again. This is what enforces "one signal
         # belongs to at most one ensemble" at recruitment time.
-        grid = csr_rows_dense(self.scan_array.intsy_arr, lane_idxs, scan_start, scan_end)
-        for i, lane in enumerate(lane_idxs):
-            ranges = self.assigned_ranges.get(int(lane))
-            if not ranges:
-                continue
+        grid = None
+        if self._intsy_csc is not None:
+            grid = csc_rows_dense(self._intsy_csc, lane_idxs, scan_start, scan_end)
+        if grid is None:
+            grid = csr_rows_dense(self.scan_array.intsy_arr, lane_idxs, scan_start, scan_end)
+        lane_idxs = np.asarray(lane_idxs, dtype=np.int64)
+        for i in np.flatnonzero(self._has_ranges[lane_idxs]).tolist():
+            ranges = self.assigned_ranges[int(lane_idxs[i])]
             for a_start, a_end in ranges:
                 lo = max(a_start, scan_start)
                 hi = min(a_end, scan_end)
@@ -915,6 +922,7 @@ class LaneMaxSeedProvider(SeedProvider):
                 lane, ftr.scan_start, ftr.scan_end
             )
             self.assigned_ranges[lane].append((c_start, c_end))
+            self._has_ranges[lane] = True
             affected.add(lane)
         self._recompute_lane_max(affected)
 
@@ -943,6 +951,7 @@ class LaneMaxSeedProvider(SeedProvider):
 
     def _zero_region(self, lane: int, seg_start: int, seg_end: int) -> None:
         self.assigned_ranges[lane].append((seg_start, seg_end))
+        self._has_ranges[lane] = True
         self._recompute_lane_max({lane})
 
     def _recompute_lane_max(self, lanes: set[int]) -> None:

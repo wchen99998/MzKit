@@ -73,6 +73,24 @@ def csc_rows_dense(csc, rows: np.ndarray, start: int, stop: int) -> Optional[np.
     return out
 
 
+def csc_rows_above(csc, cols: np.ndarray, threshold: float) -> Optional[np.ndarray]:
+    """Rows, ascending, whose max over columns ``cols`` exceeds ``threshold`` (``np.where(csc[:, cols].max(axis=1) >
+    threshold)[0]`` for a threshold of 0 or more), from those columns' entries only, so the cost follows the window
+    rather than the number of rows. None when ``csc`` is not canonical CSC or the threshold is negative."""
+    if csc.format != 'csc' or not csc.has_canonical_format or threshold < 0:
+        return None
+    cols = np.asarray(cols, dtype=np.int64)
+    if cols.size == 0:
+        return np.empty(0, dtype=np.int64)
+    lo, hi = csc.indptr[cols], csc.indptr[cols + 1]
+    if (np.diff(cols) == 1).all():  # a contiguous window: one slice
+        rows, vals = csc.indices[lo[0]:hi[-1]], csc.data[lo[0]:hi[-1]]
+    else:
+        pos = np.concatenate([np.arange(a, b) for a, b in zip(lo.tolist(), hi.tolist())])
+        rows, vals = csc.indices[pos], csc.data[pos]
+    return np.unique(rows[vals > threshold]).astype(np.int64)
+
+
 def csc_col_entries(arr, col: int) -> tuple[np.ndarray, np.ndarray]:
     """Stored (row indices, values) of one column of a CSC array, rows ascending."""
     if arr.format != 'csc' or not arr.has_canonical_format:

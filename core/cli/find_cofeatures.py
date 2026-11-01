@@ -8,6 +8,8 @@ from typing import Literal
 
 import numpy as np
 
+from core.utils.sparse_reads import csc_rows_above
+
 from core.data_structs import FeaturePointer, ScanArray
 
 
@@ -174,6 +176,11 @@ def _find_nonzero_mass_lanes(
     intsy_csc = scan_array.intsy_arr_csc
     if intsy_csc is None:
         intsy_csc = scan_array.intsy_arr.tocsc()
+    # Lanes with an entry above min_intsy in the window, from the window's entries only (a max per lane over the
+    # window costs one value per lane, on every call)
+    lanes = csc_rows_above(intsy_csc, scan_idxs, min_intsy)
+    if lanes is not None:
+        return lanes
     mass_lane_intsy_max = intsy_csc[:, scan_idxs].max(axis=1).toarray().ravel()
     nonzero_mass_lane_idxs: np.ndarray = np.where(
         mass_lane_intsy_max > min_intsy,

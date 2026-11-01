@@ -34,6 +34,14 @@ def csr_rows_dense(arr, rows: np.ndarray, start: int, stop: int) -> np.ndarray:
     total = int(n.sum())
     if total == 0:
         return out
+    if total > 4 * out.size + 1024:
+        # Rows much longer than the window (long runs: a lane can span 100k scans): binary-search each row's
+        # window, as csr_row_dense does, instead of reading every entry of every row
+        for i, (a0, m) in enumerate(zip(lo.tolist(), n.tolist())):
+            cols = arr.indices[a0:a0 + m]
+            a, b = np.searchsorted(cols, start), np.searchsorted(cols, stop)
+            out[i, cols[a:b] - start] = arr.data[a0 + a:a0 + b]
+        return out
     which = np.repeat(np.arange(rows.size), n)
     pos = np.repeat(lo - (np.cumsum(n) - n), n) + np.arange(total)
     cols = arr.indices[pos]

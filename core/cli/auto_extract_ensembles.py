@@ -30,6 +30,7 @@ per-precursor objects.
 from __future__ import annotations
 
 from collections import defaultdict
+import heapq
 from dataclasses import dataclass, field
 from typing import Literal, Optional, TYPE_CHECKING
 
@@ -748,6 +749,12 @@ class LaneMaxSeedProvider(SeedProvider):
 
         self.lane_max_intsy = self._initial_lane_max()
         self.lane_max_intsy[self.persistent_lane_mask] = 0.0
+        # Max-heap of (-lane max, lane) so next_seed finds the tallest lane without scanning every lane per seed.
+        # Entries go stale when a lane's max changes (a fresh one is pushed) and are dropped when popped. Ties
+        # pop the lowest lane index, as np.argmax returns.
+        lanes = np.flatnonzero(self.lane_max_intsy > 0)
+        self._lane_heap = list(zip((-self.lane_max_intsy[lanes]).tolist(), lanes.tolist()))
+        heapq.heapify(self._lane_heap)
 
     def _compute_persistent_lanes(self) -> np.ndarray:
         """
@@ -804,9 +811,18 @@ class LaneMaxSeedProvider(SeedProvider):
             chrom[start:end] = 0
         return chrom
 
+    def _tallest_lane(self) -> int:
+        # np.argmax(self.lane_max_intsy), via the heap while any lane is above 0
+        while self._lane_heap:
+            neg_max, lane = self._lane_heap[0]
+            if -neg_max == float(self.lane_max_intsy[lane]):
+                return lane
+            heapq.heappop(self._lane_heap)
+        return int(np.argmax(self.lane_max_intsy))
+
     def next_seed(self) -> Optional[Seed]:
         while True:
-            lane = int(np.argmax(self.lane_max_intsy))
+            lane = self._tallest_lane()
             if self.lane_max_intsy[lane] < self.config.parent_threshold:
                 return None
 
@@ -939,6 +955,8 @@ class LaneMaxSeedProvider(SeedProvider):
                 continue
             chrom = self._lane_chrom(lane)
             self.lane_max_intsy[lane] = chrom.max()
+            if self.lane_max_intsy[lane] > 0:
+                heapq.heappush(self._lane_heap, (-float(self.lane_max_intsy[lane]), lane))
 
 
 class PrecursorSeedProvider(SeedProvider):

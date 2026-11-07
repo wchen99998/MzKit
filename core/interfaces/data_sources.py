@@ -1,7 +1,8 @@
-from typing import Protocol, Optional, TYPE_CHECKING, Callable, Iterable, Literal
+from typing import Any, Protocol, Optional, TYPE_CHECKING, Callable, Iterable, Literal
 
 if TYPE_CHECKING:
     from core.data_structs import (
+        Ensemble,
         Sample,
         SampleUUID,
         AlignmentUUID,
@@ -10,9 +11,7 @@ if TYPE_CHECKING:
         GroupUUID,
     )
     from core.data_structs.alignment import EnsembleAlignment
-    from core.data_structs.analyte_group import AnalyteGroup
-    from core.data_structs.analyte_annotation import AnalyteAnnotation
-    from core.data_structs.formula_assignment import FormulaAssignment
+    from core.data_structs.ensemble_group import EnsembleGroup
     from core.data_structs.similarity_matrix import SimilarityMatrix
 
 class SampleDataSource(Protocol):
@@ -23,9 +22,8 @@ class SampleDataSource(Protocol):
     DataRegistry satisfies this by structure - it cannot inherit from it directly
      (see note in core/data_structs/data_registry.py)
 
-    Scope is deliberately limited to Samples. DataRegistry also stores
-    EnsembleAlignments and FormulaAssignments, but no consumer reaches those
-    through this protocol, so they are intentionally excluded here.
+    Scope is deliberately limited to Samples; the other protocols below
+    cover alignments, ensemble annotations, groups and matrices.
     """
     def get_sample(
         self,
@@ -57,7 +55,7 @@ class SampleDataSource(Protocol):
         addition_callback: Callable[..., None],
         removal_callback: Callable[..., None],
         update_callback: Optional[Callable[..., None]] = None,
-        change_type: Literal['Sample', 'Alignment', 'Assignment', 'Group', 'Annotation', 'Matrix'] = 'Sample',
+        change_type: Literal['Sample', 'Alignment', 'Group', 'Matrix'] = 'Sample',
     ):
         """
         Subscribe to notifications when the registry changes.
@@ -65,11 +63,12 @@ class SampleDataSource(Protocol):
         :param addition_callback: Called when an object is added.
         :param removal_callback: Called when an object is removed.
         :param update_callback: Called when an object is updated/changed.
-            Honoured for 'Sample', 'Assignment' and 'Group'; optional.
+            Honoured for 'Sample' and 'Group'; optional.
         :param change_type: Which family of changes to subscribe to.
             'Sample' subscribes to Sample add/remove/update signals;
-            'Alignment' subscribes to add/remove only; 'Assignment' and
-            'Group' also honour update_callback.
+            'Alignment' subscribes to add/remove only. Ensemble edits
+            are signalled by `sigEnsembleAnnotated` instead
+            (see EnsembleDataSource).
         """
         ...
 
@@ -96,7 +95,7 @@ class AlignmentDataSource(Protocol):
         addition_callback: Callable[..., None],
         removal_callback: Callable[..., None],
         update_callback: Optional[Callable[..., None]] = None,
-        change_type: Literal['Sample', 'Alignment', 'Assignment', 'Group', 'Annotation', 'Matrix'] = 'Sample',
+        change_type: Literal['Sample', 'Alignment', 'Group', 'Matrix'] = 'Sample',
     ):
         """
         Subscribe to alignment change notifications; call with
@@ -107,88 +106,70 @@ class AlignmentDataSource(Protocol):
         ...
 
 
-class AssignmentDataSource(Protocol):
+class EnsembleDataSource(Protocol):
     """
-    Structural contract for the read/subscribe surface over FormulaAssignments.
+    Structural contract for reading and editing what's stored on Ensembles
+    (formula assignment, structure annotation). Edits go through `update_ensemble` /
+    `set_chosen_candidate`, which emit `sigEnsembleAnnotated(ensemble_uuid)`.
+    """
+    sigEnsembleAnnotated: Any   # pyqtSignal(EnsembleUUID)
 
-    Assignments are keyed by their SOURCE uuid (an EnsembleUUID today),
-    so the lookups here take a source uuid rather than an assignment uuid.
-    """
-    def get_assignment_for_source(
+    def get_ensemble(
         self,
-        source_uuid: 'EnsembleUUID',
-    ) -> Optional['FormulaAssignment']:
+        uuid: 'EnsembleUUID',
+    ) -> Optional['Ensemble']:
         ...
 
-    def get_all_assignment_source_uuids(self) -> list['EnsembleUUID']:
+    def update_ensemble(
+        self,
+        uuid: 'EnsembleUUID',
+        **changes,
+    ):
         ...
 
-    def assignment_count(self) -> int:
+    def remove_ensembles(
+        self,
+        uuids: Iterable['EnsembleUUID'],
+    ):
+        """Delete ensembles from their injections (and from groups)"""
         ...
 
     def set_chosen_candidate(
         self,
-        source_uuid: 'EnsembleUUID',
+        uuid: 'EnsembleUUID',
         chosen_idx: Optional[int],
         chosen_by: str = 'user',
     ):
         """
-        Accept a different candidate of a registered assignment (None clears
-        the choice); notifies update subscribers.
-        """
-        ...
-
-    def register_assignment(
-        self,
-        assignment: 'FormulaAssignment',
-    ):
-        ...
-
-    def remove_assignment(
-        self,
-        source_uuid: 'EnsembleUUID',
-    ):
-        ...
-
-    def subscribe_to_changes(
-        self,
-        addition_callback: Callable[..., None],
-        removal_callback: Callable[..., None],
-        update_callback: Optional[Callable[..., None]] = None,
-        change_type: Literal['Sample', 'Alignment', 'Assignment', 'Group', 'Annotation', 'Matrix'] = 'Sample',
-    ):
-        """
-        Subscribe to assignment change notifications; call with
-        change_type='Assignment'. See SampleDataSource.subscribe_to_changes
-        for the full parameter contract; update_callback fires when an
-        assignment's chosen candidate changes.
+        Accept a different candidate of an ensemble's formula assignment
+        (None clears the choice)
         """
         ...
 
 
 class GroupDataSource(Protocol):
     """
-    Structural contract for the read/subscribe surface over AnalyteGroups.
+    Structural contract for the read/subscribe surface over EnsembleGroups.
     """
     def get_group(
         self,
         uuid: 'GroupUUID',
-    ) -> Optional['AnalyteGroup']:
+    ) -> Optional['EnsembleGroup']:
         ...
 
-    def get_all_groups(self) -> list['AnalyteGroup']:
+    def get_all_groups(self) -> list['EnsembleGroup']:
         ...
 
-    def groups_for_analytes(
+    def groups_for_ensembles(
         self,
-        analyte_uuids: Iterable['AnalyteUUID'],
-    ) -> list['AnalyteGroup']:
-        """Groups with any member in `analyte_uuids`."""
+        ensemble_uuids: Iterable['EnsembleUUID'],
+    ) -> list['EnsembleGroup']:
+        """Groups with any member in `ensemble_uuids`."""
         ...
 
     def register_group(
         self,
-        group: 'AnalyteGroup',
+        group: 'EnsembleGroup',
     ):
         ...
 
@@ -200,7 +181,7 @@ class GroupDataSource(Protocol):
 
     def notify_group_updated(
         self,
-        group: 'AnalyteGroup',
+        group: 'EnsembleGroup',
     ):
         """
         Groups are edited in place; call this after every edit so
@@ -213,51 +194,12 @@ class GroupDataSource(Protocol):
         addition_callback: Callable[..., None],
         removal_callback: Callable[..., None],
         update_callback: Optional[Callable[..., None]] = None,
-        change_type: Literal['Sample', 'Alignment', 'Assignment', 'Group', 'Annotation', 'Matrix'] = 'Sample',
+        change_type: Literal['Sample', 'Alignment', 'Group', 'Matrix'] = 'Sample',
     ):
         """
         Subscribe to group change notifications; call with
         change_type='Group'. See SampleDataSource.subscribe_to_changes
         for the full parameter contract.
-        """
-        ...
-
-
-class AnnotationDataSource(Protocol):
-    """
-    Structural contract for the read/subscribe surface over
-     AnalyteAnnotations (one per analyte).
-    """
-    def get_annotation(
-        self,
-        analyte_uuid: 'AnalyteUUID',
-    ) -> Optional['AnalyteAnnotation']:
-        ...
-
-    def register_annotation(
-        self,
-        annotation: 'AnalyteAnnotation',
-    ):
-        """Add, or replace its analyte's existing annotation."""
-        ...
-
-    def remove_annotation(
-        self,
-        analyte_uuid: 'AnalyteUUID',
-    ):
-        ...
-
-    def subscribe_to_changes(
-        self,
-        addition_callback: Callable[..., None],
-        removal_callback: Callable[..., None],
-        update_callback: Optional[Callable[..., None]] = None,
-        change_type: Literal['Sample', 'Alignment', 'Assignment', 'Group', 'Annotation', 'Matrix'] = 'Sample',
-    ):
-        """
-        Subscribe to annotation change notifications; call with
-        change_type='Annotation'. update_callback fires when an analyte's
-        annotation is replaced.
         """
         ...
 
@@ -308,7 +250,7 @@ class MatrixDataSource(Protocol):
         addition_callback: Callable[..., None],
         removal_callback: Callable[..., None],
         update_callback: Optional[Callable[..., None]] = None,
-        change_type: Literal['Sample', 'Alignment', 'Assignment', 'Group', 'Annotation', 'Matrix'] = 'Sample',
+        change_type: Literal['Sample', 'Alignment', 'Group', 'Matrix'] = 'Sample',
     ):
         """
         Subscribe to matrix change notifications; call with

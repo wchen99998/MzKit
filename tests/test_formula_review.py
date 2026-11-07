@@ -2,7 +2,7 @@
 Tests for reviewing / changing a formula assignment:
   - DataRegistry.set_chosen_candidate (+ chosen_by, update signal)
   - FormulaResultsWidget (sorting, current pick, what 'assign' reports)
-  - FormulaAssignmentDialog (assign / clear go through the registry)
+  - FormulaFinderDialog.review (frozen envelope; assign / clear go through the registry)
   - to_formula_candidate (AssignedCandidate -> find-mfs FormulaCandidate)
 """
 import os
@@ -48,26 +48,42 @@ def _assignment(chosen_idx=0):
     )
 
 
-class _Registry(DataRegistry):
-    pass
+def _registry(*uuids) -> DataRegistry:
+    """A registry holding one sample with a bare Ensemble per uuid (default SOURCE)."""
+    from core.data_structs import Ensemble
+    reg = DataRegistry()
+    ensembles = {u: Ensemble([], [], uuid=u) for u in (uuids or (SOURCE,))}
+    reg.register_sample(SimpleNamespace(
+        uuid=1, name='s', fingerprint=None,
+        injection=SimpleNamespace(ensembles=ensembles),
+    ))
+    return reg
+
+
+def _assign(reg, assignment):
+    reg.update_ensemble(assignment.source_uuid, formula_assignment=assignment)
+
+
+def _assigned(reg, uuid=SOURCE):
+    return reg.get_ensemble(uuid).formula_assignment
 
 
 # --- registry ---------------------------------------------------------------
 
 def test_set_chosen_candidate_records_who_chose(qapp):
-    reg = _Registry()
+    reg = _registry()
     a = _assignment()
     a.chosen_by = 'auto'
-    reg.register_assignment(a)
+    _assign(reg, a)
     seen = []
-    reg.sigAssignmentUpdated.connect(seen.append)
+    reg.sigEnsembleAnnotated.connect(seen.append)
 
     reg.set_chosen_candidate(SOURCE, 1)
     assert a.chosen.formula_str == "C6H12O6"
     assert a.chosen_by == 'user' and a.user_chosen
     assert reg.user_chosen_sources() == {SOURCE}
     assert reg.chosen_formulas() == {SOURCE: "C6H12O6"}
-    assert seen == [a]
+    assert seen == [SOURCE]
 
     reg.set_chosen_candidate(SOURCE, None)
     assert a.chosen is None and a.chosen_by is None and not a.user_chosen
@@ -76,24 +92,28 @@ def test_set_chosen_candidate_records_who_chose(qapp):
 
 
 def test_set_chosen_candidate_rejects_bad_targets(qapp):
-    reg = _Registry()
+    reg = _registry()
     with pytest.raises(KeyError):
         reg.set_chosen_candidate(SOURCE, 0)
-    reg.register_assignment(_assignment())
+    _assign(reg, _assignment())
     with pytest.raises(IndexError):
         reg.set_chosen_candidate(SOURCE, 3)
 
 
-def test_update_callback_subscription(qapp):
-    reg = _Registry()
-    reg.register_assignment(_assignment())
-    updated = []
-    reg.subscribe_to_changes(
-        addition_callback=lambda a: None, removal_callback=lambda a: None,
-        update_callback=updated.append, change_type='Assignment',
-    )
-    reg.set_chosen_candidate(SOURCE, 2)
-    assert len(updated) == 1
+def test_update_ensemble_emits_once_and_rejects_unknown_fields(qapp):
+    reg = _registry()
+    seen = []
+    reg.sigEnsembleAnnotated.connect(seen.append)
+    a = _assignment()
+    reg.update_ensemble(SOURCE, formula_assignment=a, identity="caffeine")
+    assert seen == [SOURCE]
+    assert _assigned(reg) is a and reg.get_ensemble(SOURCE).identity == "caffeine"
+
+    with pytest.raises(AttributeError):
+        reg.update_ensemble(SOURCE, formula=None)
+    with pytest.raises(KeyError):
+        reg.update_ensemble(999, formula_assignment=None)
+    assert seen == [SOURCE]
 
 
 # --- results widget ---------------------------------------------------------
@@ -130,25 +150,34 @@ def test_widget_starts_on_current_pick(qapp):
 
 # --- review dialog ----------------------------------------------------------
 
-def test_review_dialog_assign_and_clear(qapp):
-    from gui.dialogues.formula_assignment_dialog import FormulaAssignmentDialog
+def test_review_mode_assign_and_clear(qapp, data_registry, ensemble):
+    import gui.controllers.main_controller  # noqa: F401  (app import order)
+    from gui.dialogues.formula_finder import FormulaFinderDialog
+    from core.data_structs.ensemble import AdductNetwork
 
-    reg = _Registry()
-    reg.register_assignment(_assignment())
+    a = _assignment()
+    a.source_uuid, a.envelope, a.scan_num = ensemble.uuid, [0], ensemble.base_scan_num
+    net = AdductNetwork(M=1.0, base_envelope=[0], ions={0: '[M+Na]+'})
+    data_registry.update_ensemble(ensemble.uuid, formula_assignment=a, adduct_network=net)
 
-    dlg = FormulaAssignmentDialog(reg, SOURCE)
-    dlg.results.btnClearAssignment.click()
-    assert reg.get_assignment_for_source(SOURCE).chosen is None
-    assert dlg.results.assignment.chosen_idx is None   # dialog refreshed
+    dlg = FormulaFinderDialog.review(data_registry, ensemble)
+    assert dlg.tableInput.rowCount() == 1 and not dlg.tableInput.isEnabled()
+    assert dlg.btnFindIonMF.isHidden() and dlg.btnAddSignal.isHidden()
+    assert dlg.comboIon.currentText() == '[M+Na]+'
 
-    dlg.results.tableResults.selectRow(1)             # posterior order
-    dlg.results.btnAssignSelected.click()
-    assert reg.get_assignment_for_source(SOURCE).chosen_idx == 1
+    dlg.formulaResults.btnClearAssignment.click()
+    assert ensemble.formula_assignment.chosen is None
+    assert dlg.formulaResults.assignment.chosen_idx is None   # dialog refreshed
+
+    dlg.formulaResults.tableResults.selectRow(1)             # posterior order
+    dlg.formulaResults.btnAssignSelected.click()
+    assert ensemble.formula_assignment.chosen_idx == 1
+    assert ensemble.formula_assignment.chosen_by == 'user'
+    assert ensemble.adduct_network is net
 
     # Closed + deleted: later registry updates must not reach it
-    dlg.close()
     qapp.processEvents()
-    reg.set_chosen_candidate(SOURCE, 0)
+    data_registry.set_chosen_candidate(ensemble.uuid, 0)
 
 
 # --- conversion -------------------------------------------------------------
@@ -168,9 +197,9 @@ def test_completion_keeps_user_picks_made_mid_run(qapp):
     from gui.controllers.main_controller import MainController
     from core.cli.auto_find_mfs import BatchAnnotationResult
 
-    reg = _Registry()
+    reg = _registry()
     mine = _assignment()
-    reg.register_assignment(mine)
+    _assign(reg, mine)
     reg.set_chosen_candidate(SOURCE, 2)                  # user pick
 
     ctl = SimpleNamespace(
@@ -182,14 +211,14 @@ def test_completion_keeps_user_picks_made_mid_run(qapp):
     result = BatchAnnotationResult(assignments=[fresh], n_ensembles=1)
 
     MainController._on_auto_find_mf_complete(ctl, result)
-    assert reg.get_assignment_for_source(SOURCE) is mine
+    assert _assigned(reg) is mine
     assert ctl.main_view.statusbar.currentMessage() == (
         "find-mfs: Annotated 0 of 1 ensemble; kept 1 user-chosen formula"
     )
 
     result = BatchAnnotationResult(assignments=[fresh], n_ensembles=1)
     MainController._on_auto_find_mf_complete(ctl, result, protect_user_choices=False)
-    assert reg.get_assignment_for_source(SOURCE) is fresh
+    assert _assigned(reg) is fresh
 
 
 def test_alignment_viewer_find_mfs_action(qapp):
@@ -246,10 +275,10 @@ def test_alignment_viewer_find_mfs_action(qapp):
 
 
 def test_sidebar_formula_batch_collects_and_clears(qapp, monkeypatch):
-    from core.data_structs.data_registry import DataRegistry
     from gui.controllers.main_controller import MainController
 
-    e1, e2, e3 = (SimpleNamespace(uuid=i) for i in (1, 2, 3))
+    registry = _registry(1, 2, 3)
+    e1, e2, e3 = (registry.get_ensemble(i) for i in (1, 2, 3))
     samples = [
         SimpleNamespace(injection=SimpleNamespace(ensembles={1: e1, 2: e2})),
         SimpleNamespace(injection=None),   # a fingerprint-only sample
@@ -258,9 +287,8 @@ def test_sidebar_formula_batch_collects_and_clears(qapp, monkeypatch):
         SimpleNamespace(resolve_members=lambda get: {'s1': e2, 's2': e3}),
         SimpleNamespace(resolve_members=lambda get: {'s1': e3}),
     ])
-    registry = DataRegistry()
-    for uuid in (2, 3):
-        registry.register_assignment(SimpleNamespace(source_uuid=uuid))
+    for e in (e2, e3):
+        e.formula_assignment = FormulaAssignment(source_uuid=e.uuid, candidates=[])
     batches, messages = [], []
     controller = SimpleNamespace(
         sample_controller=SimpleNamespace(
@@ -283,8 +311,8 @@ def test_sidebar_formula_batch_collects_and_clears(qapp, monkeypatch):
     answers = [QMessageBox.No, QMessageBox.Yes]
     monkeypatch.setattr(QMessageBox, "question", lambda *a: answers.pop(0))
     run('Sample', 'clear')                   # declined: kept
-    assert registry.get_assignment_for_source(2) is not None
+    assert e2.formula_assignment is not None
     run('Sample', 'clear')                   # only the samples' ensembles go
-    assert registry.get_assignment_for_source(2) is None
-    assert registry.get_assignment_for_source(3) is not None
+    assert e2.formula_assignment is None
+    assert e3.formula_assignment is not None
     assert messages[-1] == "Removed 1 formula assignment"

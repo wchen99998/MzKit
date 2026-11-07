@@ -6,6 +6,8 @@ group), else plain-Python signals with the same connect/emit API; should not
 otherwise involve any Qt.
 """
 
+from dataclasses import fields
+
 from core.utils.signals import QObject, pyqtSignal
 
 from core.interfaces.data_sources import SampleDataSource
@@ -13,6 +15,7 @@ from core.interfaces.data_sources import SampleDataSource
 from typing import Iterable, Optional, TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from core.data_structs import (
+        Ensemble,
         Sample,
         SampleUUID,
         InjectionUUID,
@@ -23,9 +26,7 @@ if TYPE_CHECKING:
         GroupUUID,
     )
     from core.data_structs.alignment import EnsembleAlignment
-    from core.data_structs.analyte_group import AnalyteGroup
-    from core.data_structs.analyte_annotation import AnalyteAnnotation
-    from core.data_structs.formula_assignment import FormulaAssignment
+    from core.data_structs.ensemble_group import EnsembleGroup
     from core.data_structs.similarity_matrix import SimilarityMatrix
 
 class DataRegistry(
@@ -56,32 +57,17 @@ class DataRegistry(
     sigAlignmentRemoved = pyqtSignal(
         object  # EnsembleAlignment
     )
-    sigAssignmentAdded = pyqtSignal(
-        object  # FormulaAssignment
-    )
-    sigAssignmentRemoved = pyqtSignal(
-        object  # FormulaAssignment
-    )
-    sigAssignmentUpdated = pyqtSignal(
-        object  # FormulaAssignment (e.g. its chosen candidate changed)
+    sigEnsembleAnnotated = pyqtSignal(
+        object  # EnsembleUUID (its formula_assignment / annotation changed)
     )
     sigGroupAdded = pyqtSignal(
-        object  # AnalyteGroup
+        object  # EnsembleGroup
     )
     sigGroupRemoved = pyqtSignal(
-        object  # AnalyteGroup
+        object  # EnsembleGroup
     )
     sigGroupUpdated = pyqtSignal(
-        object  # AnalyteGroup (edited in place: title, notes, membership)
-    )
-    sigAnnotationAdded = pyqtSignal(
-        object  # AnalyteAnnotation
-    )
-    sigAnnotationRemoved = pyqtSignal(
-        object  # AnalyteAnnotation
-    )
-    sigAnnotationUpdated = pyqtSignal(
-        object  # AnalyteAnnotation (replaced one for the same analyte)
+        object  # EnsembleGroup (edited in place: title, notes, membership)
     )
     sigMatrixAdded = pyqtSignal(
         object  # SimilarityMatrix
@@ -94,12 +80,9 @@ class DataRegistry(
         self._samples: dict['SampleUUID', 'Sample'] = {}
         self._sample_name_to_uuid: dict[str, 'SampleUUID'] = {}
         self._alignments: dict['AlignmentUUID', 'EnsembleAlignment'] = {}
-        # Keyed by SOURCE uuid (an EnsembleUUID today); latest assignment wins.
-        self._assignments: dict['EnsembleUUID', 'FormulaAssignment'] = {}
-        self._groups: dict['GroupUUID', 'AnalyteGroup'] = {}
-        # Reverse index for groups_for_analytes; rebuilt on every group change
-        self._groups_by_analyte: dict['AnalyteUUID', set['GroupUUID']] = {}
-        self._annotations: dict['AnalyteUUID', 'AnalyteAnnotation'] = {}
+        self._groups: dict['GroupUUID', 'EnsembleGroup'] = {}
+        # Reverse index for groups_for_ensembles; rebuilt on every group change
+        self._groups_by_ensemble: dict['EnsembleUUID', set['GroupUUID']] = {}
         self._matrices: dict[int, 'SimilarityMatrix'] = {}
         super().__init__()
 
@@ -109,7 +92,7 @@ class DataRegistry(
         removal_callback,
         update_callback=None,
         change_type: Literal[
-            'Sample', 'Alignment', 'Assignment', 'Group', 'Annotation', 'Matrix'
+            'Sample', 'Alignment', 'Group', 'Matrix'
         ] = 'Sample',
     ):
         match change_type:
@@ -136,20 +119,6 @@ class DataRegistry(
                     removal_callback
                 )
 
-            case 'Assignment':
-                self.sigAssignmentAdded.connect(
-                    addition_callback
-                )
-
-                self.sigAssignmentRemoved.connect(
-                    removal_callback
-                )
-
-                if update_callback:
-                    self.sigAssignmentUpdated.connect(
-                        update_callback
-                    )
-
             case 'Group':
                 self.sigGroupAdded.connect(
                     addition_callback
@@ -161,20 +130,6 @@ class DataRegistry(
 
                 if update_callback:
                     self.sigGroupUpdated.connect(
-                        update_callback
-                    )
-
-            case 'Annotation':
-                self.sigAnnotationAdded.connect(
-                    addition_callback
-                )
-
-                self.sigAnnotationRemoved.connect(
-                    removal_callback
-                )
-
-                if update_callback:
-                    self.sigAnnotationUpdated.connect(
                         update_callback
                     )
 
@@ -251,6 +206,8 @@ class DataRegistry(
             )
             del self._samples[uuid]
             del self._sample_name_to_uuid[sample_to_remove.name]
+            if sample_to_remove.injection is not None:
+                self._prune_groups(set(sample_to_remove.injection.ensembles))
 
             return
 
@@ -357,21 +314,16 @@ class DataRegistry(
         are dropped), so all existing references and signal/slot
         connections held by controllers, models and views remain valid.
 
-        Assignments and alignments are removed first, since they reference
-        Samples (via source/ensemble UUIDs). Removing the last alignment
-        orphans every group, so groups go with it.
+        Alignments are removed first, since they reference Samples (via
+        ensemble UUIDs). Formula assignments and annotations live on the
+        ensembles and go with their samples.
         """
-        for source_uuid in self.get_all_assignment_source_uuids():
-            self.remove_assignment(source_uuid)
-
         for uuid in self.get_all_alignment_uuids():
             self.remove_alignment(uuid)
 
-        # Groups/matrices not caught by orphan collection (e.g. no alignments)
+        # Groups / matrices not caught by pruning (e.g. dangling members)
         for group in self.get_all_groups():
             self.remove_group(group.uuid)
-        for annotation in self.get_all_annotations():
-            self.remove_annotation(annotation.analyte_uuid)
         for matrix in self.get_all_matrices():
             self.remove_matrix(matrix.uuid)
 
@@ -430,20 +382,15 @@ class DataRegistry(
 
     def _collect_orphans(self):
         """
-        Drop every group / annotation / similarity matrix none of whose analytes appear
-        in any remaining alignment (run after an alignment is removed).
+        Drop every similarity matrix none of whose analytes appear in any
+        remaining alignment (run after an alignment is removed). Annotations
+        and groups belong to ensembles, so they outlive alignments.
         """
         live = {
             analyte.uuid
             for alignment in self._alignments.values()
             for analyte in alignment.analytes
         }
-        for group in self.get_all_groups():
-            if live.isdisjoint(group.analyte_uuids):
-                self.remove_group(group.uuid)
-        for annotation in self.get_all_annotations():
-            if annotation.analyte_uuid not in live:
-                self.remove_annotation(annotation.analyte_uuid)
         live_ids = {str(uuid) for uuid in live}
         for matrix in self.get_all_matrices():
             if live_ids.isdisjoint(matrix.ids):
@@ -463,47 +410,107 @@ class DataRegistry(
     def alignment_count(self) -> int:
         return len(self._alignments)
 
-    # --- Formula assignment methods ---
+    # --- Ensemble methods ---
 
-    def register_assignment(
+    def _ensembles(self) -> Iterable['Ensemble']:
+        for sample in self._samples.values():
+            if sample.injection is not None:
+                yield from sample.injection.ensembles.values()
+
+    def get_ensemble(
         self,
-        assignment: 'FormulaAssignment',
+        uuid: 'EnsembleUUID',
+    ) -> Optional['Ensemble']:
+        for sample in self._samples.values():
+            if sample.injection is not None and uuid in sample.injection.ensembles:
+                return sample.injection.ensembles[uuid]
+        return None
+
+    def update_ensemble(
+        self,
+        uuid: 'EnsembleUUID',
+        **changes,
     ):
         """
-        Registers a FormulaAssignment, keyed by its source UUID. Replaces any
-        existing assignment for the same source (latest wins).
+        Set an ensemble's annotation fields (e.g. `formula_assignment=...`)
+        and emit one sigEnsembleAnnotated, so every view showing them
+        refreshes. Every edit of those fields must come through here.
         """
-        self._assignments[assignment.source_uuid] = assignment
-        self.sigAssignmentAdded.emit(assignment)
+        ensemble = self.get_ensemble(uuid)
+        if ensemble is None:
+            raise KeyError(f"No ensemble {uuid} registered")
+        unknown = set(changes) - {f.name for f in fields(ensemble)}
+        if unknown:
+            raise AttributeError(f"Ensemble has no field(s) {sorted(unknown)}")
+        # A DDA ensemble's representative MS2 follows its network's ions
+        refresh = 'adduct_network' in changes and ensemble.is_dda
+        before = ensemble.composite_spectrum.precursor_mz if refresh else None
+        for name, value in changes.items():
+            setattr(ensemble, name, value)
+        if refresh:
+            ensemble._composite = None
+            if ensemble.composite_spectrum.precursor_mz != before:
+                self._invalidate_ms2_of(uuid)
+        self.sigEnsembleAnnotated.emit(uuid)
 
-    def remove_assignment(
+    def _invalidate_ms2_of(self, uuid: 'EnsembleUUID'):
+        """
+        An ensemble's representative MS2 changed: its analytes' cached
+        representatives are reset, and the computed (not imported)
+        similarity matrices covering them removed.
+        """
+        from core.data_structs.similarity_matrix import IMPORTED
+
+        analytes = [
+            a for alignment in self._alignments.values() for a in alignment.analytes
+            if uuid in a.ensemble_map.values()
+        ]
+        for analyte in analytes:
+            analyte._representative = None
+        for matrix in self.matrices_for_analytes(a.uuid for a in analytes):
+            if matrix.provenance.get('source') != IMPORTED:
+                self.remove_matrix(matrix.uuid)
+
+    def remove_ensembles(
         self,
-        source_uuid: 'EnsembleUUID',
+        uuids: Iterable['EnsembleUUID'],
     ):
-        if source_uuid in self._assignments:
-            assignment = self._assignments[source_uuid]
-            self.sigAssignmentRemoved.emit(assignment)
-            del self._assignments[source_uuid]
+        """
+        Delete ensembles from their injections, dropping them from groups
+        (a group left empty goes too). Alignments referencing them aren't
+        touched: their members just stop resolving.
+        """
+        gone = set(uuids)
+        for sample in self._samples.values():
+            if sample.injection is not None:
+                for uuid in gone & set(sample.injection.ensembles):
+                    sample.injection.remove_ensemble(uuid)
+        self._prune_groups(gone)
 
-    def get_assignment_for_source(
-        self,
-        source_uuid: 'EnsembleUUID',
-    ) -> Optional['FormulaAssignment']:
-        return self._assignments.get(source_uuid)
+    def _prune_groups(self, gone: set['EnsembleUUID']):
+        for group in self.get_all_groups():
+            if gone.isdisjoint(group.ensemble_uuids):
+                continue
+            group.ensemble_uuids = [u for u in group.ensemble_uuids if u not in gone]
+            if group.ensemble_uuids:
+                self.notify_group_updated(group)
+            else:
+                self.remove_group(group.uuid)
 
     def set_chosen_candidate(
         self,
-        source_uuid: 'EnsembleUUID',
+        uuid: 'EnsembleUUID',
         chosen_idx: Optional[int],
         chosen_by: str = 'user',
     ):
         """
-        Accept a different candidate of a registered assignment (None clears
-        the choice), recording who chose it.
+        Accept a different candidate of an ensemble's formula assignment
+        (None clears the choice), recording who chose it.
         """
-        assignment = self._assignments.get(source_uuid)
+        ensemble = self.get_ensemble(uuid)
+        assignment = ensemble.formula_assignment if ensemble is not None else None
         if assignment is None:
-            raise KeyError(f"No formula assignment for source {source_uuid}")
+            raise KeyError(f"No formula assignment for ensemble {uuid}")
         if chosen_idx is not None and not 0 <= chosen_idx < len(assignment.candidates):
             raise IndexError(
                 f"Candidate {chosen_idx} out of range "
@@ -512,65 +519,29 @@ class DataRegistry(
 
         assignment.chosen_idx = chosen_idx
         assignment.chosen_by = chosen_by if chosen_idx is not None else None
-        self.sigAssignmentUpdated.emit(assignment)
+        self.sigEnsembleAnnotated.emit(uuid)
 
     def user_chosen_sources(self) -> set['EnsembleUUID']:
-        """Sources whose formula the user chose (auto runs must keep them)."""
+        """Ensembles whose formula the user chose (auto runs must keep them)."""
         return {
-            uuid for uuid, a in self._assignments.items() if a.user_chosen
+            e.uuid for e in self._ensembles()
+            if e.formula_assignment is not None and e.formula_assignment.user_chosen
         }
 
     def chosen_formulas(self) -> dict['EnsembleUUID', str]:
-        """Accepted formula per source, for exports."""
+        """Accepted formula per ensemble, for exports."""
         return {
-            uuid: a.chosen.formula_str
-            for uuid, a in self._assignments.items()
-            if a.chosen is not None
+            e.uuid: e.formula_assignment.chosen.formula_str
+            for e in self._ensembles()
+            if e.formula_assignment is not None
+            and e.formula_assignment.chosen is not None
         }
-
-    def get_all_assignment_source_uuids(
-        self,
-    ) -> list['EnsembleUUID']:
-        return list(self._assignments.keys())
-
-    def assignment_count(self) -> int:
-        return len(self._assignments)
-
-    # --- Analyte annotation methods ---
-
-    def register_annotation(
-        self,
-        annotation: 'AnalyteAnnotation',
-    ):
-        """Add, or replace its analyte's existing annotation."""
-        existed = annotation.analyte_uuid in self._annotations
-        self._annotations[annotation.analyte_uuid] = annotation
-        if existed:
-            self.sigAnnotationUpdated.emit(annotation)
-        else:
-            self.sigAnnotationAdded.emit(annotation)
-
-    def remove_annotation(
-        self,
-        analyte_uuid: 'AnalyteUUID',
-    ):
-        if analyte_uuid in self._annotations:
-            self.sigAnnotationRemoved.emit(self._annotations.pop(analyte_uuid))
-
-    def get_annotation(
-        self,
-        analyte_uuid: 'AnalyteUUID',
-    ) -> Optional['AnalyteAnnotation']:
-        return self._annotations.get(analyte_uuid)
-
-    def get_all_annotations(self) -> list['AnalyteAnnotation']:
-        return list(self._annotations.values())
 
     # --- Analyte group methods ---
 
     def register_group(
         self,
-        group: 'AnalyteGroup',
+        group: 'EnsembleGroup',
     ):
         self._groups[group.uuid] = group
         self._rebuild_group_index()
@@ -588,15 +559,15 @@ class DataRegistry(
     def get_group(
         self,
         uuid: 'GroupUUID',
-    ) -> Optional['AnalyteGroup']:
+    ) -> Optional['EnsembleGroup']:
         return self._groups.get(uuid)
 
-    def get_all_groups(self) -> list['AnalyteGroup']:
+    def get_all_groups(self) -> list['EnsembleGroup']:
         return list(self._groups.values())
 
     def notify_group_updated(
         self,
-        group: 'AnalyteGroup',
+        group: 'EnsembleGroup',
     ):
         """
         Groups are edited in place; every edit path must call this so the
@@ -605,28 +576,35 @@ class DataRegistry(
         self._rebuild_group_index()
         self.sigGroupUpdated.emit(group)
 
-    def groups_for_analytes(
+    def groups_for_ensembles(
         self,
-        analyte_uuids: Iterable['AnalyteUUID'],
-    ) -> list['AnalyteGroup']:
-        """Groups with any member in `analyte_uuids`, in registration order."""
+        ensemble_uuids: Iterable['EnsembleUUID'],
+    ) -> list['EnsembleGroup']:
+        """Groups with any member in `ensemble_uuids`, in registration order."""
         hits = set()
-        for uuid in analyte_uuids:
-            hits |= self._groups_by_analyte.get(uuid, set())
+        for uuid in ensemble_uuids:
+            hits |= self._groups_by_ensemble.get(uuid, set())
         return [g for u, g in self._groups.items() if u in hits]
 
-    def group_titles(self) -> dict['AnalyteUUID', str]:
+    def group_titles(
+        self,
+        alignment: 'EnsembleAlignment',
+    ) -> dict['AnalyteUUID', str]:
         """
-        Titles of every group each analyte belongs to (oldest group first,
-        joined by ';'), for exports. Untitled groups are skipped.
+        Per analyte of `alignment`: the titles of every group any of its
+        member ensembles belongs to (oldest group first, joined by ';'), for
+        exports. Untitled groups are skipped.
         """
-        titles: dict['AnalyteUUID', list[str]] = {}
-        for group in sorted(self._groups.values(), key=lambda g: g.created_at):
-            if not group.title:
-                continue
-            for uuid in group.analyte_uuids:
-                titles.setdefault(uuid, []).append(group.title)
-        return {uuid: ';'.join(t) for uuid, t in titles.items()}
+        titled = sorted(
+            (g for g in self._groups.values() if g.title), key=lambda g: g.created_at,
+        )
+        titles: dict['AnalyteUUID', str] = {}
+        for analyte in alignment.analytes:
+            members = set(analyte.ensemble_map.values())
+            hits = [g.title for g in titled if not members.isdisjoint(g.ensemble_uuids)]
+            if hits:
+                titles[analyte.uuid] = ';'.join(dict.fromkeys(hits))
+        return titles
 
     # --- Similarity matrix methods ---
 
@@ -683,10 +661,10 @@ class DataRegistry(
         return None
 
     def _rebuild_group_index(self):
-        self._groups_by_analyte = {}
+        self._groups_by_ensemble = {}
         for group in self._groups.values():
-            for uuid in group.analyte_uuids:
-                self._groups_by_analyte.setdefault(uuid, set()).add(group.uuid)
+            for uuid in group.ensemble_uuids:
+                self._groups_by_ensemble.setdefault(uuid, set()).add(group.uuid)
 
 def _merge_is_valid(
     source: 'Sample',

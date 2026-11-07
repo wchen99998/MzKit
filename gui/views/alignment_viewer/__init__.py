@@ -22,7 +22,7 @@ imported lineage (e.g. a taxonomy). Parameters: the sample cluster
 button's menu (sample_cluster_params_dialog.py). Exports
 (MainController) use both modes' applied settings (`export_settings`).
 
-User AnalyteGroups (core/data_structs/analyte_group.py) are drawn on the
+User EnsembleGroups (core/data_structs/ensemble_group.py) are drawn on the
 group track above the map in either layout (gui/widgets/AlignmentGroupTrackWidget.py)
 and edited from the Inspector's groups panel (groups_panel.py, group_dialog.py).
 
@@ -39,7 +39,6 @@ The status bar shows a hover readout.
 Actions into the Ensemble / Sample viewers go out via signals the
 MainController wires up.
 """
-import dataclasses
 from typing import Optional, TYPE_CHECKING
 
 from PyQt5 import QtWidgets, QtCore, QtGui
@@ -53,17 +52,15 @@ from core.cli.cluster_samples import (
     LINEAGE, SampleClusterParams, SampleClustering, cluster_samples_by,
     sample_cluster_params_from_config,
 )
-from core.data_structs.analyte_annotation import AnalyteAnnotation
 from core.data_structs.similarity_matrix import SimilarityMatrix
 from core.utils.config import load_config
-from core.utils.render_molecule import smiles_to_svg
 from gui.resources.AlignmentViewerWindow import Ui_Form
 from gui.views.alignment_viewer.cluster_params_dialog import ClusterParamsDialog
 from gui.views.alignment_viewer.context import AlignmentContext
 from gui.views.alignment_viewer.detail_panel import DetailPanel, XIC_COLOR
-from gui.views.alignment_viewer.group_dialog import AnalyteGroupDialog, jsonable
+from gui.views.alignment_viewer.group_dialog import EnsembleGroupDialog, jsonable
 from gui.views.alignment_viewer.groups_panel import (
-    GroupsPanel, selection_analyte_uuids,
+    GroupsPanel, selection_ensemble_uuids,
 )
 from gui.views.alignment_viewer.inspector import Inspector
 from gui.views.alignment_viewer.render_params_dialog import RenderParamsDialog
@@ -74,6 +71,7 @@ from gui.widgets.alignment_plot.layout import (
     ANCHOR_COLOR, CURRENT_COLOR, HoverTarget,
 )
 from gui.widgets.alignment_plot.params import RenderParams
+from gui.widgets.annotation_tabs import AnnotationTabs
 from gui.widgets.alignment_plot.selection import target_key
 
 if TYPE_CHECKING:
@@ -95,8 +93,14 @@ class AlignmentViewer(
     sigViewEnsembleRequested = QtCore.pyqtSignal(object)  # Ensemble
     sigAddSamplesRequested = QtCore.pyqtSignal(object)     # list[SampleUUID]
     sigAutoFindMfsRequested = QtCore.pyqtSignal(object)    # list[Ensemble]
+    # Source Ensemble, list[Ensemble] members, m/z tolerance (Da): core.formula.bulk
+    sigApplyFormulaRequested = QtCore.pyqtSignal(object, object, float)
     # EnsembleAlignment, ClusterParams (compute) | SimilarityMatrix, linkage
     sigClusterRequested = QtCore.pyqtSignal(object, object, str)
+    # AnnotationTabs target key, rank_candidates kwargs; the result goes back to annotation_tabs.set_ranking
+    sigRankCandidatesRequested = QtCore.pyqtSignal(object, dict)
+    # Spectral search slot, search_spectra kwargs; the result goes back to annotation_tabs.set_spectral_result
+    sigSpectralSearchRequested = QtCore.pyqtSignal(object, dict)
 
     def __init__(
         self,
@@ -149,20 +153,18 @@ class AlignmentViewer(
             title_label=self.labelInspectorTitle,
             stack=self.stackedWidget,
             summary_label=self.labelAlignmentSummary,
-            edit_name=self.editAnalyteName,
-            edit_smiles=self.editAnalyteSmiles,
             tree_compare=self.treeCompare,
-            svg_structure=self.svgAnalyteStructure,
         )
         self.groups_panel = GroupsPanel(
             self.data_source,
             combo=self.comboGroups,
-            svg=self.svgGroupStructure,
             btn_edit=self.btnGroupEdit,
             btn_delete=self.btnGroupDelete,
             btn_add=self.btnGroupAddSelected,
             btn_remove=self.btnGroupRemoveSelected,
         )
+        # Annotation / Search tabs: the bottom MS2 plot mirrors their selection
+        self.annotation_tabs = AnnotationTabs(self.tabsAnnotation, self.data_source)
         # Analyte -> x of the current layout, shared with the group track
         self._x_of_analyte: dict = {}
 
@@ -183,7 +185,6 @@ class AlignmentViewer(
         self.splitter_2.setSizePolicy(
             QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding,
         )
-        self.svgGroupStructure.setMinimumWidth(0)
         # [Group] | [Edit] [Del] | [Add] [Remove]
         for btn in (self.btnGroupDelete, self.btnGroupSelected):
             line = QtWidgets.QFrame()
@@ -194,8 +195,8 @@ class AlignmentViewer(
             )
         self.splitter_3.setStretchFactor(1, 1)
         self.splitter_3.setSizes([260, 575])
-        # Inspector column: selection page / analyte panel / groups
-        self.splitter_2.setSizes([200, 420, 160])
+        # Inspector column: selection page / analyte editor + annotation / groups
+        self.splitter_2.setSizes([140, 700, 40])
         self.splitter.setSizes([550, 450])
         self.plotDendrogram.link_to(self.plot_item)
         self.plotDendrogram.hide()
@@ -279,7 +280,13 @@ class AlignmentViewer(
         self.inspector.sigEnsembleActivated.connect(
             self.sigViewEnsembleRequested
         )
-        self.inspector.sigAnnotationEdited.connect(self._on_annotation_edited)
+        tabs = self.annotation_tabs
+        tabs.sigRankRequested.connect(self.sigRankCandidatesRequested)
+        tabs.sigSpectralSearchRequested.connect(self.sigSpectralSearchRequested)
+        tabs.sigMirror.connect(self._on_mirror)
+        tabs.sigStatus.connect(self.status_bar.showMessage)
+        self.plotMS2.sigMirrorSignalHovered.connect(self._on_ms2_mirror_hovered)
+        self.plotMS2.sigMSpectrumLeaved.connect(self._on_ms2_mirror_left)
 
         self.btnLinkRT.toggled.connect(self._update_rt_link)
         self.btnFrameSelection.toggled.connect(self.detail_panel.set_frame_selection)
@@ -301,12 +308,7 @@ class AlignmentViewer(
         # Formula assignments landing (from EnsembleViewer, auto find-mfs,
         # ...) and annotations change what the Inspector shows; the plots
         # (and their zoom) are left alone
-        self.data_source.subscribe_to_changes(
-            addition_callback=self._refresh_inspector,
-            removal_callback=self._refresh_inspector,
-            update_callback=self._refresh_inspector,
-            change_type='Assignment',
-        )
+        self.data_source.sigEnsembleAnnotated.connect(self._refresh_inspector)
         self.data_source.subscribe_to_changes(
             addition_callback=lambda _: None,
             removal_callback=self._on_alignment_removed,
@@ -317,12 +319,6 @@ class AlignmentViewer(
             removal_callback=self._on_groups_changed,
             update_callback=self._on_groups_changed,
             change_type='Group',
-        )
-        self.data_source.subscribe_to_changes(
-            addition_callback=self._refresh_inspector,
-            removal_callback=self._refresh_inspector,
-            update_callback=self._refresh_inspector,
-            change_type='Annotation',
         )
         self.data_source.subscribe_to_changes(
             addition_callback=lambda _: None,
@@ -764,9 +760,10 @@ class AlignmentViewer(
         """The analyte panel follows the focus's analyte (an ensemble's parent)."""
         focus = self.selection_model.focus
         if focus is None or self._ctx is None:
-            self.inspector.show_focus(None, None)
+            self.annotation_tabs.set_target(None)
             return
-        self.inspector.show_focus(self._ctx, focus.analyte)
+        ensemble = focus.ensemble if focus.kind == 'ensemble' else None
+        self.annotation_tabs.set_target(self._ctx.annotation_target(focus.analyte, ensemble))
 
     def _refresh_inspector(self, *_):
         """Re-show the tree and analyte panel (e.g. a formula or annotation changed)."""
@@ -789,6 +786,7 @@ class AlignmentViewer(
         if state == self._details_state:
             return
         self._details_state = state
+        self.annotation_tabs.forget_mirror()
         if ctx is None or focus is None:
             self.detail_panel.clear()
             return
@@ -827,26 +825,21 @@ class AlignmentViewer(
         """Re-show the tree (e.g. so Similarity picks up a new clustering)."""
         self._show_tree()
 
-    def _on_annotation_edited(self, analyte_uuid, field: str, value: str):
-        """A Name / SMILES edit: validate, then update the registry."""
-        old = (
-            self.data_source.get_annotation(analyte_uuid)
-            or AnalyteAnnotation(analyte_uuid)
-        )
-        if getattr(old, field) == value:
-            return
-        if field == 'smiles' and value:
-            try:
-                smiles_to_svg(value)
-            except ValueError as e:
-                QtWidgets.QMessageBox.warning(self, "Invalid SMILES", str(e))
-                self._show_focus()   # revert the field
-                return
-        new = dataclasses.replace(old, **{field: value})
-        if new.is_empty:
-            self.data_source.remove_annotation(analyte_uuid)
+    def _on_mirror(self, spec):
+        """Draw the annotation tabs' MS2 mirror (None: back to the focus's spectra)."""
+        if spec is None:
+            self._details_state = None   # force a redraw
+            self._refresh_details()
         else:
-            self.data_source.register_annotation(new)
+            self.detail_panel.show_ms2_mirror(*spec)
+
+    def _on_ms2_mirror_hovered(self, signal: tuple):
+        """(half, spec_idx, mz, intsy): a predicted peak lights up its fragment."""
+        if signal[0] == 'bottom':
+            self.annotation_tabs.mirror_hovered(signal[1])
+
+    def _on_ms2_mirror_left(self):
+        self.annotation_tabs.mirror_hovered(None)
 
     def _anchor_similarities(self) -> dict:
         """
@@ -982,20 +975,35 @@ class AlignmentViewer(
                 self.btnClusterMode.setChecked(False)
             self._render(preserve_selection=True)
             self._refresh_compare()
+        # Sample clustering's MS2 grouping cut that matrix's clustering: redo it
+        grouping = self._sample_inputs[2]
+        if grouping is not None and grouping.params.matrix_uuid == matrix.uuid:
+            self._sample_clustering = None
+            if self.btnSampleClusterMode.isChecked():
+                self._on_sample_cluster_mode_toggled(True)
 
-    # -- analyte groups -----------------------------------------------------
+    # -- ensemble groups ----------------------------------------------------
 
     def _on_groups_changed(self, _group):
         self._refresh_groups()
+
+    def _analyte_of(self) -> dict:
+        """EnsembleUUID -> AnalyteUUID over the shown alignment's members."""
+        if self._alignment is None:
+            return {}
+        return {
+            e: a.uuid for a in self._alignment.analytes for e in a.ensemble_map.values()
+        }
 
     def _refresh_groups(self):
         """Redraw the group track and the Inspector's groups panel."""
         if self._alignment is None:
             self.plotGroupTrack.clear_groups()
         else:
+            analyte_of = self._analyte_of()
             self.plotGroupTrack.set_groups(
-                self.data_source.groups_for_analytes(self._x_of_analyte),
-                self._x_of_analyte,
+                self.data_source.groups_for_ensembles(analyte_of),
+                self._x_of_analyte, analyte_of,
             )
         self.plotGroupTrack.setVisible(
             self._alignment is not None and self.plotGroupTrack.has_visible_groups()
@@ -1003,27 +1011,24 @@ class AlignmentViewer(
         self._refresh_groups_panel()
 
     def _refresh_groups_panel(self):
-        selected = selection_analyte_uuids(self.selection_model.selection)
+        selected = selection_ensemble_uuids(self.selection_model.selection)
         self.btnGroupSelected.setEnabled(bool(selected))
-        in_view = (
-            {a.uuid for a in self._alignment.analytes} if self._alignment else set()
-        )
-        self.groups_panel.refresh(in_view, selected)
+        self.groups_panel.refresh(set(self._analyte_of()), selected)
 
     def _group_analytes(self, targets: Optional[list[HoverTarget]] = None):
         """Open the group dialog for `targets` (default: the selection)."""
-        analyte_uuids = selection_analyte_uuids(
+        ensemble_uuids = selection_ensemble_uuids(
             self.selection_model.selection if targets is None else targets
         )
-        if self._alignment is None or not analyte_uuids:
+        if self._alignment is None or not ensemble_uuids:
             return
         clustering = self._active_clustering()
         provenance = {
             'alignment_uuid': self._alignment.uuid,
             'clustering': None if clustering is None else jsonable(clustering.params),
         }
-        AnalyteGroupDialog(
-            self.data_source, analyte_uuids, provenance, parent=self,
+        EnsembleGroupDialog(
+            self.data_source, ensemble_uuids, provenance, parent=self,
         ).exec_()
 
     # -- context menu -------------------------------------------------------
@@ -1070,12 +1075,14 @@ class AlignmentViewer(
 
         if target is not None:
             self._add_find_mfs_action(menu, target)
+            if len(self._menu_targets(target)) == 1 and target.kind in ('ensemble', 'analyte'):
+                self._add_apply_formula_action(menu, target)
 
             targets = self._menu_targets(target)
-            if selection_analyte_uuids(targets):
+            if selection_ensemble_uuids(targets):
                 if not menu.isEmpty():
                     menu.addSeparator()
-                menu.addAction("Group selected analytes…").triggered.connect(
+                menu.addAction("Group selection…").triggered.connect(
                     lambda: self._group_analytes(targets)
                 )
 
@@ -1144,6 +1151,48 @@ class AlignmentViewer(
         )
         action.triggered.connect(
             lambda: self.sigAutoFindMfsRequested.emit(ensembles)
+        )
+
+    def _add_apply_formula_action(self, menu: QtWidgets.QMenu, target: HoverTarget):
+        """
+        'Apply its formula to all aligned members': the right-clicked
+        ensemble's (the representative member's, for an analyte) formula and
+        ion, searched for again on every other member (core/formula/bulk.py).
+        """
+        from core.formula.bulk import source_ion
+
+        ctx, analyte = self._ctx, target.analyte
+        if ctx is None or analyte is None:
+            return
+        source = ctx.target_ensemble(analyte, target.ensemble if target.kind == 'ensemble' else None)
+        assignment = source and source.formula_assignment
+        others = [e for e in ctx.members(analyte).values() if source is not None and e.uuid != source.uuid]
+        if not others or assignment is None or assignment.chosen is None or not assignment.envelope:
+            return
+        ion = source_ion(source)
+        action = menu.addAction(
+            f"Apply {assignment.chosen.formula_str} as {ion.label if ion else '?'} "
+            f"to {len(others)} other aligned member{'' if len(others) == 1 else 's'}"
+        )
+        if ion is None:
+            action.setEnabled(False)
+            action.setToolTip("Its ion is unknown: pick one in the formula finder first")
+            return
+        action.triggered.connect(lambda: self._apply_formula(source, others))
+
+    def _apply_formula(self, source: 'Ensemble', others: list['Ensemble']):
+        n_manual = sum(
+            1 for e in others
+            if e.formula_assignment is not None and e.formula_assignment.chosen_by == 'user'
+        )
+        if QtWidgets.QMessageBox.question(
+            self, "Apply formula to all aligned members",
+            f"Re-search {len(others)} member{'' if len(others) == 1 else 's'}, "
+            f"{n_manual} of them were manually assigned.",
+        ) != QtWidgets.QMessageBox.Yes:
+            return
+        self.sigApplyFormulaRequested.emit(
+            source, others, float(self._alignment.parameters.mz_tolerance),
         )
 
     def _ensembles_for(

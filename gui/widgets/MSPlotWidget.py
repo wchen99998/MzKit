@@ -5,6 +5,7 @@ from gui.widgets.text_items import center_textitem
 from gui.utils.ms_arrays import zero_pad_arrays
 from core.utils.arrays import find_closest_point
 from core.utils.array_types import SpectrumArray
+from core.utils.spectra import informative_max
 from core.utils.spectrum_export import mgf_block
 from gui.views.sample_viewer.tools import (
     ToolType, ToolStage, XICMode,
@@ -231,6 +232,11 @@ class MSPlotWidget(pg.PlotWidget):
         # self.setBackground(None)
         self.pi : MSPlotItem = self.getPlotItem()
 
+        # Positive tick length draws ticks outside the plot area, so they
+        # aren't mistaken for small MS signals
+        for axis in ('bottom', 'left'):
+            self.pi.getAxis(axis).setStyle(tickLength=5)
+
         self.sigSpectrumArrayChanged.connect(
             self.pi.updateSpectrumPlot
         )
@@ -372,6 +378,7 @@ class MSPlotWidget(pg.PlotWidget):
     def add_signal_marker(
         self,
         spec_idx: int,
+        **style,
     ):
         """
         Adds a signal marker to the plot, based on the currently
@@ -390,6 +397,7 @@ class MSPlotWidget(pg.PlotWidget):
         signal_marker = pg.TargetItem(
             pos=(mz, intsy),
             movable=False,
+            **style,   # pg.TargetItem's symbol / size / pen / brush
         )
 
         self.signal_markers[spec_idx] = signal_marker
@@ -620,21 +628,31 @@ class MSPlotWidget(pg.PlotWidget):
         top_label: str = "",
         bottom_label: str = "",
         matched: Optional[list[tuple[int, int]]] = None,
+        labels_right: bool = False,
+        top_precursor: Optional[float] = None,
+        bottom_precursor: Optional[float] = None,
     ) -> None:
         """
         Draws `top` as normal and `bottom` flipped below zero. Each
         spectrum is normalised to its own maximum, so the y-axis runs
-        -100...100%.
+        -1...1 (fractions of each maximum).
+
+        :param top_precursor: / bottom_precursor: MS2 precursor m/z; the
+            maximum is then taken below the precursor region, and precursor
+            peaks above it run off the plot
 
         :param top_label: Text drawn in the top-left corner of the plot
         :param bottom_label: Text drawn in the bottom-left corner
+        :param labels_right: Put both labels in the right-hand corners
+            instead (low m/z, on the left, is often the busy end)
         :param matched: (top_idx, bottom_idx) pairs of matched peaks
             (e.g. from matchms CosineGreedy). If given, matched peaks are
             drawn in the normal colour and unmatched peaks dimmed.
             If None, all peaks are drawn in the normal colour.
         """
         self.pi.set_mirror_spectra(
-            top, bottom, top_label, bottom_label, matched,
+            top, bottom, top_label, bottom_label, matched, labels_right,
+            top_precursor, bottom_precursor,
         )
 
     def clear_mirror(self) -> None:
@@ -811,9 +829,11 @@ class MSPlotItem(pg.PlotItem):
             label.setDefaultTextColor(
                 pg.mkColor(pg.getConfigOption('foreground'))
             )
+            label.document().setDocumentMargin(0)
             label.setZValue(1000)
             label.setVisible(False)
             self.mirror_labels[corner] = label
+        self.mirror_labels_right = False
         self.vb.sigResized.connect(self._reposition_mirror_labels)
 
         # State tracking
@@ -825,7 +845,7 @@ class MSPlotItem(pg.PlotItem):
 
         # Mirror mode state. None when in single-spectrum mode. In mirror
         # mode, `spectrum_array` holds both spectra concatenated (top
-        # first, bottom after), normalised to %, with bottom intensities
+        # first, bottom after), normalised to 1, with bottom intensities
         # negated. See set_mirror_spectra().
         self.mirror: Optional[dict] = None
 
@@ -850,6 +870,9 @@ class MSPlotItem(pg.PlotItem):
         top_label: str = "",
         bottom_label: str = "",
         matched: Optional[list[tuple[int, int]]] = None,
+        labels_right: bool = False,
+        top_precursor: Optional[float] = None,
+        bottom_precursor: Optional[float] = None,
     ) -> None:
         n_top = len(top)
 
@@ -859,8 +882,8 @@ class MSPlotItem(pg.PlotItem):
         )
         combined['mz'][:n_top] = top['mz']
         combined['mz'][n_top:] = bottom['mz']
-        combined['intsy'][:n_top] = _normalise_intsy(top['intsy'])
-        combined['intsy'][n_top:] = -_normalise_intsy(bottom['intsy'])
+        combined['intsy'][:n_top] = _normalise_intsy(top, top_precursor)
+        combined['intsy'][n_top:] = -_normalise_intsy(bottom, bottom_precursor)
 
         matched_mask = None
         if matched is not None:
@@ -875,6 +898,7 @@ class MSPlotItem(pg.PlotItem):
             'n_top': n_top,
             'matched_mask': matched_mask,
         })
+        self.mirror_labels_right = labels_right
         self.mirror_labels['top'].setPlainText(top_label)
         self.mirror_labels['bottom'].setPlainText(bottom_label)
         self._reposition_mirror_labels()
@@ -943,14 +967,14 @@ class MSPlotItem(pg.PlotItem):
         )
 
     def _reposition_mirror_labels(self) -> None:
-        margin = 4
+        margin = 3
         rect = self.vb.rect()
-        self.mirror_labels['top'].setPos(margin, margin)
-        bottom = self.mirror_labels['bottom']
-        bottom.setPos(
-            margin,
-            rect.height() - bottom.boundingRect().height() - margin,
-        )
+        for corner, label in self.mirror_labels.items():
+            size = label.boundingRect()
+            label.setPos(
+                rect.width() - size.width() - margin if self.mirror_labels_right else margin,
+                margin if corner == 'top' else rect.height() - size.height() - margin,
+            )
 
     def updateSpectrumPlot(
         self,
@@ -992,9 +1016,12 @@ class MSPlotItem(pg.PlotItem):
 
     def scaleViewboxToSpectrumArray(
             self,
+            intsy_max: Optional[float] = None,
     ):
         """
         Scales viewbox to fit the spectrum array
+        (`intsy_max` caps the tallest intensity it fits, e.g. a normalised
+        MS2 whose precursor runs above 1)
         """
         if self.spectrum_array is None:
             return
@@ -1011,16 +1038,20 @@ class MSPlotItem(pg.PlotItem):
         )
 
         if self.mirror is not None:
-            # Both halves are normalised to 100%; less headroom is
+            # Both halves are normalised to 1; less headroom is
             # needed than for a single spectrum
-            y_max = np.nanmax(np.abs(self.spectrum_array['intsy'])) * 1.30
+            # Capped at 1: precursor peaks may exceed it (see _normalise_intsy)
+            y_max = min(np.nanmax(np.abs(self.spectrum_array['intsy'])), 1.0) * 1.30
             self.vb.setYRange(min=-y_max, max=y_max)
             return
 
+        top = np.nanmax(self.spectrum_array['intsy'])
+        if intsy_max is not None:
+            top = min(top, intsy_max)
         self.vb.setYRange(
             min=0,
             max=(
-                    np.nanmax(self.spectrum_array['intsy']) * 1.60
+                    top * 1.60
             ),
         )
 
@@ -1720,18 +1751,18 @@ class MSLabelManager(QtCore.QObject):
 
 
 def _normalise_intsy(
-        intsy: np.ndarray,
+        spectrum: np.ndarray,
+        precursor_mz: Optional[float] = None,
 ) -> np.ndarray:
     """
-    Scales intensities to % of their maximum (all zeros if empty/flat)
+    Scales intensities to a fraction of their maximum (all zeros if empty/flat);
+    with `precursor_mz`, of the maximum below the precursor region
     """
-    intsy = np.asarray(intsy, dtype=np.float64)
-    if intsy.size == 0:
-        return intsy
-    max_intsy = np.nanmax(intsy)
+    intsy = np.asarray(spectrum['intsy'], dtype=np.float64)
+    max_intsy = informative_max(spectrum, precursor_mz) if intsy.size else 0.0
     if not max_intsy > 0:
         return np.zeros_like(intsy)
-    return intsy / max_intsy * 100.0
+    return intsy / max_intsy
 
 
 def generate_labeltext(

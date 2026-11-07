@@ -16,9 +16,12 @@ from core.cli.export_ensemble import (
 from core.utils.config import load_config
 from core.utils.formula_formatting import (
     format_formula_obj_to_html,
+    format_assignment_formula_text,
     format_assignment_label_html,
 )
 from gui.resources.EnsembleViewerWindow import Ui_Form
+from gui.widgets.annotation_tabs import AnnotationTabs
+from gui.widgets.annotation_target import AnnotationTarget, ensemble_adduct
 from gui.views.ensemble_viewer.tools import (
     ToolType, ToolStage, Mode,
     ToolManager,
@@ -54,6 +57,9 @@ class EnsembleViewer(
     # Auto-annotate (find-mfs) requested for the current ensemble. The
     # MainController runs it through ProcessController and registers the result.
     sigAutoFindMfRequested = QtCore.pyqtSignal(object)  # Ensemble
+    # The annotation tabs' background work, as the Alignment Viewer's (MainController runs it)
+    sigRankCandidatesRequested = QtCore.pyqtSignal(object, dict)
+    sigSpectralSearchRequested = QtCore.pyqtSignal(object, dict)
 
     def __init__(
         self,
@@ -120,15 +126,55 @@ class EnsembleViewer(
         self._connect_signals()
         self._hide_misc_plots()
         self._add_status_bar()
+        self._setup_annotation_tabs()
 
         # React to formula assignments (from the manual tool, the auto button,
         # or a headless batch) landing for whatever ensemble is on screen, so
         # the title strip + adduct labels refresh without a bespoke callback.
-        self.data_source.subscribe_to_changes(
-            addition_callback=self._on_assignment_changed,
-            removal_callback=self._on_assignment_changed,
-            update_callback=self._on_assignment_changed,
-            change_type='Assignment',
+        self.data_source.sigEnsembleAnnotated.connect(self._on_assignment_changed)
+
+    def _setup_annotation_tabs(self):
+        """
+        Annotation / Search tabs for the ensemble on screen, in the misc-plots
+        tab widget; their mirror takes over the MS2 plot.
+        """
+        tabs = self.annotation_tabs = AnnotationTabs(self.tabWidget, self.data_source)
+        tabs.sigRankRequested.connect(self.sigRankCandidatesRequested)
+        tabs.sigSpectralSearchRequested.connect(self.sigSpectralSearchRequested)
+        tabs.sigMirror.connect(self._on_mirror)
+        tabs.sigStatus.connect(self.status_bar.showMessage)
+        self.ms2_plot.sigMirrorSignalHovered.connect(
+            lambda signal: signal[0] == 'bottom' and tabs.mirror_hovered(signal[1])
+        )
+        self.ms2_plot.sigMSpectrumLeaved.connect(lambda: tabs.mirror_hovered(None))
+
+    def _annotation_target(self) -> Optional[AnnotationTarget]:
+        """The annotation tabs' target: the ensemble on screen, with its composite MS2."""
+        e = self.ensemble
+        if e is None:
+            return None
+        composite = e.composite_spectrum
+        return AnnotationTarget(
+            key=('ensemble', e.uuid),
+            ensemble=e,
+            ms2=composite.ms2,
+            precursor_mz=composite.precursor_mz,
+            formula=format_assignment_formula_text(e.formula_assignment).rstrip('?') or None,
+            adduct=ensemble_adduct(e),
+            header=f"{e.injection.name} · m/z {e.base_mz:.4f} · {e.peak_rt / 60:.2f} min",
+            members=[e],
+        )
+
+    def _on_mirror(self, spec):
+        """Draw the annotation tabs' MS2 mirror (None: back to the MS2 on screen)."""
+        if spec is None:
+            self.ms2_plot.clear_mirror()
+            self.spectrum_manager.redraw_ms2()
+            self._redraw_annotations_for_current_scan()
+            return
+        self.ms2_plot.set_mirror_spectra(
+            spec.top, spec.bottom, spec.top_label, spec.bottom_label, matched=spec.matches,
+            labels_right=True, top_precursor=spec.top_precursor, bottom_precursor=spec.bottom_precursor,
         )
 
     def _add_status_bar(self):
@@ -481,6 +527,7 @@ class EnsembleViewer(
         self._redraw_annotations_for_current_scan()
         self.initialize_property_table()
         self.refresh_assignment_display()
+        self.annotation_tabs.set_target(self._annotation_target())
 
         self.toolAutoFindMf.setEnabled(True)
         self.actionAutoFindMf.setEnabled(True)
@@ -498,31 +545,22 @@ class EnsembleViewer(
 
         self.actionReviewFormula.setEnabled(
             self.ensemble is not None
-            and self.data_source.get_assignment_for_source(self.ensemble.uuid)
-            is not None
+            and self.ensemble.formula_assignment is not None
         )
 
     def _on_review_formula_triggered(self):
         """Open the current ensemble's formula assignment for review."""
         if not self.ensemble:
             return
-        from gui.dialogues.formula_assignment_dialog import (
-            FormulaAssignmentDialog, ensemble_title,
-        )
+        from gui.dialogues.formula_finder import FormulaFinderDialog
 
-        FormulaAssignmentDialog(
-            self.data_source,
-            self.ensemble.uuid,
-            title=ensemble_title(self.ensemble),
-            parent=self,
+        FormulaFinderDialog.review(
+            self.data_source, self.ensemble, parent=self, config=self.config,
         ).show()
 
     def _assignment_label_html(self) -> Optional[str]:
         # Shared with the sample-viewer overlays (single label source of truth).
-        assignment = self.data_source.get_assignment_for_source(
-            self.ensemble.uuid
-        )
-        return format_assignment_label_html(assignment)
+        return format_assignment_label_html(self.ensemble.formula_assignment)
 
     def _on_auto_find_mf_triggered(self):
         """
@@ -532,21 +570,19 @@ class EnsembleViewer(
         if self.ensemble:
             self.sigAutoFindMfRequested.emit(self.ensemble)
 
-    def _on_assignment_changed(self, assignment):
+    def _on_assignment_changed(self, ensemble_uuid):
         """
-        A FormulaAssignment was added/removed. If it's for the ensemble on
+        An ensemble's formula assignment changed. If it's the ensemble on
         screen, refresh the formula title strip and redraw annotations (the
-        auto pass may have attached adduct labels to the ensemble).
+        adduct network may have changed too).
         """
-        if (
-            not self.ensemble
-            or getattr(assignment, 'source_uuid', None) != self.ensemble.uuid
-        ):
+        if not self.ensemble or ensemble_uuid != self.ensemble.uuid:
             return
         self.refresh_assignment_display()
         self._redraw_annotations_for_current_scan()
         if self.properties_model is not None:
             self.properties_model.refresh_formula()
+        self.annotation_tabs.set_target(self._annotation_target())
 
     def reset_for_new_project(self):
         """
@@ -564,6 +600,7 @@ class EnsembleViewer(
         self.properties_model = None
 
         self.refresh_assignment_display()
+        self.annotation_tabs.set_target(None)
 
     def _hide_misc_plots(self):
         self.checkShowMiscPlots.setChecked(False)
@@ -1049,7 +1086,7 @@ class EnsembleViewer(
 
     def add_generic_annotation(
         self,
-        cofeature_idx: int,
+        cofeature_idxs: list[int],
         ms_level: Literal[1, 2],
         text: str,
     ):
@@ -1057,7 +1094,7 @@ class EnsembleViewer(
             return
 
         annotation = self.ensemble.add_generic_annot(
-            cofeature_idx=cofeature_idx,
+            cofeature_idxs=cofeature_idxs,
             ms_level=ms_level,
             text=text,
             scan_num=self._current_scan_num(ms_level),
@@ -1107,7 +1144,7 @@ class EnsembleViewer(
         if target is None:
             return
 
-        target.formula = formula
+        target.formula = str(formula.formula)
 
         # The bracket was already drawn with the plain Δ label; clear
         # and redraw so the new two-line label takes effect.
@@ -1125,7 +1162,7 @@ class EnsembleViewer(
         # prominence and demote the \u0394 m/z to a small subtitle line.
         if annotation.formula is not None:
             formula_html = format_formula_obj_to_html(
-                annotation.formula.formula
+                Formula(annotation.formula)
             )
             label = (
                 f'<div style="text-align:center;">'
@@ -1164,6 +1201,11 @@ class EnsembleViewer(
             return None
         return int(scan_array.rt_to_scan_num(self.spectrum_manager.selected_rt))
 
+    def ms1_scan_on_screen(self) -> int:
+        """The MS1 scan on screen; the composite's MS1 is a single scan too."""
+        scan_num = self._current_scan_num(1)
+        return scan_num if scan_num is not None else self.ensemble.composite_ms1_scan_num()
+
     def _draw_ion_annotation(self, annotation: 'IonAnnotation'):
         """
         Draws an ion annotation graphic (label + isotope envelope)
@@ -1183,7 +1225,7 @@ class EnsembleViewer(
 
     def _draw_generic_annotation(self, annotation: 'GenericAnnotation'):
         """
-        Draws a free-form user annotation as an anchored text label.
+        Draws a free-form user annotation as a text label at its first peak.
         """
         ms_plot = {
             1: self.ms1_plot,
@@ -1191,7 +1233,7 @@ class EnsembleViewer(
         }[annotation.ms_level]
 
         plot_id = ms_plot.add_anchored_label(
-            spec_idx=annotation.cofeature_idx,
+            spec_idx=annotation.cofeature_idxs[0],
             text=annotation.text,
         )
         self._generic_annot_plot_ids[annotation.uuid] = plot_id
@@ -1250,8 +1292,11 @@ class EnsembleViewer(
         if not self.ensemble:
             return
 
-        # Reset transient plot-id maps \u2014 the prior IDs were invalidated
-        # by the spectrum redraw / clear_*().
+        # Idempotent: also called without a spectrum change (sigEnsembleAnnotated)
+        for plot in (self.ms1_plot, self.ms2_plot):
+            plot.clear_anchored_labels()
+            plot.clear_ion_annotations()
+            plot.clear_delta_brackets()
         self._mz_diff_plot_ids.clear()
         self._ion_annot_plot_ids.clear()
         self._generic_annot_plot_ids.clear()
@@ -1267,6 +1312,28 @@ class EnsembleViewer(
         for annotation in self.ensemble.generic_annots.values():
             if self._is_annot_on_current_scan(annotation):
                 self._draw_generic_annotation(annotation)
+
+        # Ion of each MS1 envelope (scan-agnostic; not clickable/deletable)
+        network = self.ensemble.adduct_network
+        for cofeature_idx, ion in (network.ions.items() if network else ()):
+            self.ms1_plot.add_anchored_label(spec_idx=cofeature_idx, text=ion)
+
+        # The formula assignment over the envelope it was searched with, on
+        # that scan (drawn like an ion annotation, but not one)
+        assignment = self.ensemble.formula_assignment
+        candidate = assignment and (assignment.chosen or assignment.top)
+        if (candidate and assignment.envelope
+                and assignment.scan_num == self.ms1_scan_on_screen()):
+            shown = IonAnnotation(
+                cofeature_idxs=assignment.envelope, ms_level=1,
+                formula=candidate.formula_str, error_ppm=candidate.error_ppm,
+                adduct=candidate.adduct,
+            )
+            self.ms1_plot.add_ion_annotation(
+                spec_idxs=shown.cofeature_idxs,
+                text=shown.format_string,
+                envelope=shown.isotope_envelope,
+            )
 
         # Keep chromatogram-side markers in sync with whatever lives on
         # the ensemble right now. Cheap (one ScatterPlotItem swap) and
@@ -1383,7 +1450,7 @@ class EnsembleViewer(
 
         # Only 'mz_diff' and 'ion' annotations can carry a formula
         # (GenericAnnotation has no formula field).
-        annot_formula: Optional['FormulaCandidate'] = None
+        annot_formula: Optional[str] = None
         if kind == 'mz_diff':
             match = next(
                 (a for a in self.ensemble.mz_diffs if a.uuid == annot_uuid), None
@@ -1404,7 +1471,7 @@ class EnsembleViewer(
 
         if chosen is set_min_action or chosen is set_max_action:
             formula_finder = self.tool_controllers[ToolType.FINDFORMULA].formula_finder_menu
-            formula_str = str(annot_formula.formula)
+            formula_str = annot_formula
 
             if chosen is set_min_action:
                 formula_finder.lineMinCounts.setText(formula_str)
@@ -1479,7 +1546,7 @@ class EnsembleViewer(
         if not out_dir:
             return
 
-        assignment = self.data_source.get_assignment_for_source(self.ensemble.uuid)
+        assignment = self.ensemble.formula_assignment
         chosen = assignment.chosen if assignment is not None else None
         export = build_ensemble_export(
             self.ensemble,

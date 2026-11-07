@@ -6,8 +6,7 @@ from .scan_array import ScanArray
 from .ensemble import Ensemble, IonAnnotation
 from .feature_pointer import FeaturePointer
 from .alignment import EnsembleAlignment, AlignedAnalyte, AlignmentParams
-from .analyte_group import AnalyteGroup
-from .analyte_annotation import AnalyteAnnotation
+from .ensemble_group import EnsembleGroup
 from .similarity_matrix import SimilarityMatrix
 from .uuid_types import (
     SampleUUID, FingerprintUUID, InjectionUUID, ScanArrayUUID,
@@ -34,8 +33,7 @@ __all__ = [
     "FeaturePointer",
     "AlignmentUUID",
     "AnalyteUUID",
-    "AnalyteGroup",
-    "AnalyteAnnotation",
+    "EnsembleGroup",
     "GroupUUID",
     "SimilarityMatrix",
 ]

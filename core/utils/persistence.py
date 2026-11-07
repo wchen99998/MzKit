@@ -12,6 +12,8 @@ from core.data_structs import (
 )
 from core.data_structs.scan_array import ScanArrayParameters
 from core.data_structs.ensemble import (
+    AdductNetwork,
+    EnsembleAnnotation,
     GenericAnnotation,
     IonAnnotation,
     IonPairAnnotation,
@@ -26,8 +28,7 @@ from core.data_structs.formula_assignment import (
     FormulaAssignment,
     AssignedCandidate,
 )
-from core.data_structs.analyte_group import AnalyteGroup
-from core.data_structs.analyte_annotation import AnalyteAnnotation
+from core.data_structs.ensemble_group import EnsembleGroup
 from core.data_structs.similarity_matrix import ImportParams, SimilarityMatrix
 
 import logging
@@ -39,14 +40,12 @@ from pathlib import Path
 from dataclasses import asdict
 
 import numpy as np
-from find_mfs import FormulaCandidate
-from molmass import Formula
 
-from typing import NamedTuple, TYPE_CHECKING
+from typing import NamedTuple, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     pass
 
-__version__ = "1.5.0"
+__version__ = "2.0.0"
 logger = logging.getLogger(__name__)
 
 
@@ -54,10 +53,8 @@ class ProjectData(NamedTuple):
     """Everything load_project() reconstitutes from an .mzk file."""
     samples: list[Sample]
     alignments: list[EnsembleAlignment]
-    assignments: list[FormulaAssignment]
-    groups: list[AnalyteGroup]
+    groups: list[EnsembleGroup]
     matrices: list[SimilarityMatrix]
-    annotations: list[AnalyteAnnotation]
 
 def save_project(
     filepath: Path,
@@ -144,18 +141,6 @@ def save_project(
             for alignment in alignments:
                 serialize_alignment(alignment, zf)
 
-        # Serialize formula assignments
-        assignments = [
-            data_registry.get_assignment_for_source(source_uuid)
-            for source_uuid in data_registry.get_all_assignment_source_uuids()
-        ]
-        if assignments:
-            logger.info(
-                f"Packaging {len(assignments)} formula assignments"
-            )
-            for assignment in assignments:
-                serialize_assignment(assignment, zf)
-
         # Serialize analyte groups
         groups = data_registry.get_all_groups()
         if groups:
@@ -164,13 +149,6 @@ def save_project(
             )
             for group in groups:
                 serialize_group(group, zf)
-
-        # Serialize analyte annotations (name + structure)
-        for annotation in data_registry.get_all_annotations():
-            zf.writestr(
-                f"annotations/{annotation.analyte_uuid}.json",
-                data=json.dumps(asdict(annotation), indent=2),
-            )
 
         # Serialize similarity matrices (computed and imported, raw values)
         matrices = data_registry.get_all_matrices()
@@ -234,69 +212,55 @@ def deserialize_alignment(
         uuid=data['uuid'],
         name=data.get('name', ''),
         sample_uuids=tuple(data['sample_uuids']),
-        parameters=AlignmentParams(**data['parameters']),
+        # Drop keys of retired params (e.g. pre-MS1-only ms2_* / weights)
+        parameters=AlignmentParams(**{
+            k: v for k, v in data['parameters'].items()
+            if k in AlignmentParams._fields
+        }),
         analytes=analytes,
     )
 
 
-def serialize_assignment(
-    assignment: 'FormulaAssignment',
-    zf: 'zipfile.ZipFile',
-):
-    # FormulaAssignment is primitive-only (AssignedCandidate included), so asdict
-    # captures every score term losslessly -- unlike the lossy FormulaCandidate
-    # annotation format elsewhere in this module.
-    zf.writestr(
-        f"assignments/{assignment.uuid}.json",
-        data=json.dumps(asdict(assignment), indent=2),
-    )
+def _generic_annot(d: dict) -> GenericAnnotation:
+    # Pre-2.0 files: one `cofeature_idx`, and a `source` key
+    d = {k: v for k, v in d.items() if k != 'source'}
+    if 'cofeature_idx' in d:
+        d['cofeature_idxs'] = [d.pop('cofeature_idx')]
+    return GenericAnnotation(**d)
 
 
-def deserialize_assignment(
-    assignment_path: str,
-    zf: 'zipfile.ZipFile',
-) -> 'FormulaAssignment':
-    data = json.loads(zf.read(assignment_path))
+def deserialize_assignment(data: Optional[dict]) -> Optional['FormulaAssignment']:
+    """
+    Inverse of asdict(FormulaAssignment): it's primitive-only
+    (AssignedCandidate included), so asdict captures every score term losslessly
+    """
+    if data is None:
+        return None
+    data = dict(data)  # don't mutate the source
     candidates = [AssignedCandidate(**c) for c in data.pop('candidates')]
     return FormulaAssignment(candidates=candidates, **data)
 
 
 def serialize_group(
-    group: 'AnalyteGroup',
+    group: 'EnsembleGroup',
     zf: 'zipfile.ZipFile',
 ):
-    group_dict = {
-        'uuid': group.uuid,
-        'analyte_uuids': list(group.analyte_uuids),
-        'title': group.title,
-        'notes': group.notes,
-        'smiles': group.smiles,
-        'created_at': group.created_at,
-        'provenance': group.provenance,
-    }
+    # Primitive-only, so asdict round-trips it
     zf.writestr(
         f"groups/{group.uuid}.json",
-        data=json.dumps(group_dict, indent=2),
+        data=json.dumps(asdict(group), indent=2),
     )
 
 
 def deserialize_group(
     group_path: str,
     zf: 'zipfile.ZipFile',
-) -> 'AnalyteGroup':
+) -> Optional['EnsembleGroup']:
+    """None for a pre-2026-11 group of analytes (not migrated)."""
     data = json.loads(zf.read(group_path))
-    # .get() defaults keep later field additions backward compatible
-    group = AnalyteGroup(
-        analyte_uuids=data['analyte_uuids'],
-        uuid=data['uuid'],
-        title=data.get('title', ''),
-        notes=data.get('notes', ''),
-        smiles=data.get('smiles', ''),
-        provenance=data.get('provenance'),
-    )
-    if 'created_at' in data:
-        group.created_at = data['created_at']
-    return group
+    if 'ensemble_uuids' not in data:
+        return None
+    return EnsembleGroup(**data)
 
 
 def serialize_matrix(
@@ -434,63 +398,30 @@ def serialize_injection_ensembles(
 
     ensemble_data: list[dict] = []
     for ensemble in sample.injection.ensembles.values():
-
-        # Convert ion_annots dict values from dataclass to dict
-        serialized_ion_annots = {}
-        for key, ion_annot in ensemble.ion_annots.items():
-            annot_dict = asdict(ion_annot)
-            # Convert FormulaCandidate to a serializable format
-            annot_dict['formula'] = {
-                'formula_str': str(ion_annot.formula.formula),
-                'error_ppm': ion_annot.formula.error_ppm,
-            }
-            serialized_ion_annots[key] = annot_dict
-
-        # Convert ion_pair_annots list from dataclass to dict
-        serialized_ion_pair_annots = []
-        for ion_pair_annot in ensemble.ion_pair_annots:
-            annot_dict = asdict(ion_pair_annot)
-            # Convert Formula to string
-            annot_dict['formula_diff'] = str(ion_pair_annot.formula_diff)
-            serialized_ion_pair_annots.append(annot_dict)
-
-        # Convert mz_diffs to dicts. Pulled apart by-field because the
-        # optional FormulaCandidate inside can't go through asdict.
-        serialized_mz_diffs = []
-        for mz_diff in ensemble.mz_diffs:
-            mz_diff_dict = {
-                'cofeature_a_idx': mz_diff.cofeature_a_idx,
-                'cofeature_b_idx': mz_diff.cofeature_b_idx,
-                'ms_level': mz_diff.ms_level,
-                'delta_mz': mz_diff.delta_mz,
-                'uuid': mz_diff.uuid,
-                'user_label': mz_diff.user_label,
-                'scan_num': mz_diff.scan_num,
-                'formula': (
-                    None if mz_diff.formula is None
-                    else {
-                        'formula_str': str(mz_diff.formula.formula),
-                        'error_ppm': mz_diff.formula.error_ppm,
-                    }
-                ),
-            }
-            serialized_mz_diffs.append(mz_diff_dict)
-
-        # Generic free-form annotations
-        serialized_generic_annots = {
-            key: asdict(annot)
-            for key, annot in ensemble.generic_annots.items()
-        }
-
         # Must be serialized without injection reference
         ensemble_dict = {
             'uuid': ensemble.uuid,
             'ms1_cofeatures': ensemble.ms1_cofeatures,
             'ms2_cofeatures': ensemble.ms2_cofeatures,
-            'mz_diffs': serialized_mz_diffs,
-            'ion_annots': serialized_ion_annots,
-            'ion_pair_annots': serialized_ion_pair_annots,
-            'generic_annots': serialized_generic_annots,
+            # Annotations are primitive-only dataclasses
+            'mz_diffs': [asdict(a) for a in ensemble.mz_diffs],
+            'ion_annots': {k: asdict(a) for k, a in ensemble.ion_annots.items()},
+            'ion_pair_annots': [asdict(a) for a in ensemble.ion_pair_annots],
+            'generic_annots': {
+                k: asdict(a) for k, a in ensemble.generic_annots.items()
+            },
+            'formula_assignment': (
+                asdict(ensemble.formula_assignment)
+                if ensemble.formula_assignment is not None else None
+            ),
+            'adduct_network': (
+                asdict(ensemble.adduct_network)
+                if ensemble.adduct_network is not None else None
+            ),
+            'annotation': (
+                asdict(ensemble.annotation)
+                if ensemble.annotation is not None else None
+            ),
             # User-editable properties
             'identity': ensemble.identity,
             'user_metadata': ensemble.user_metadata,
@@ -556,19 +487,17 @@ def load_project(
 ) -> ProjectData:
     """
     Given a path to an .mzk file generated using save_project(),
-    reconstitutes Samples, EnsembleAlignments, FormulaAssignments and
-    AnalyteGroups.
+    reconstitutes Samples (their ensembles carrying formula assignments),
+    EnsembleAlignments and EnsembleGroups.
 
     :param filepath: Path to .mzk file
-    :return: ProjectData(samples, alignments, assignments, groups, matrices,
-        annotations)
+    :return: ProjectData(samples, alignments, groups, matrices)
     """
     _sanity_checks(filepath)
 
     samples: list[Sample] = []
     alignments: list[EnsembleAlignment] = []
-    assignments: list[FormulaAssignment] = []
-    groups: list[AnalyteGroup] = []
+    groups: list[EnsembleGroup] = []
     matrices: list[SimilarityMatrix] = []
 
     with zipfile.ZipFile(
@@ -635,33 +564,28 @@ def load_project(
                 continue
             alignments.append(alignment)
 
-        # Load formula assignments
-        assignment_paths = [
-            name for name in zf.namelist()
-            if name.startswith('assignments/')
-            and name.endswith('.json')
-        ]
-        for assignment_path in assignment_paths:
-            try:
-                assignment = deserialize_assignment(assignment_path, zf)
-            except TypeError:
-                # Pre-1.2.0 assignments carry the old element-set provenance
-                # fields; these are deliberately not migrated (re-assign instead)
-                logger.warning(
-                    f"Skipping formula assignment {assignment_path}: saved by "
-                    f"an older format version; please re-run formula assignment."
-                )
-                continue
-            assignments.append(assignment)
+        # Pre-2026-11 files kept assignments in their own folder; not migrated
+        if any(name.startswith('assignments/') for name in zf.namelist()):
+            logger.warning(
+                "This project's formula assignments were saved by an older "
+                "format version and are not loaded; please re-run find-mfs."
+            )
 
-        # Load analyte groups (absent before 1.4.0)
+        # Load ensemble groups (absent before 1.4.0)
         group_paths = [
             name for name in zf.namelist()
             if name.startswith('groups/')
             and name.endswith('.json')
         ]
         for group_path in group_paths:
-            groups.append(deserialize_group(group_path, zf))
+            group = deserialize_group(group_path, zf)
+            if group is None:
+                logger.warning(
+                    f"Skipping group {group_path}: a group of analytes saved by "
+                    f"an older format version; please re-create it."
+                )
+                continue
+            groups.append(group)
 
         # Load similarity matrices (absent before 1.4.0)
         matrices = [
@@ -669,29 +593,25 @@ def load_project(
             if name.startswith('similarity/') and name.endswith('.json')
         ]
 
-        # Load analyte annotations (absent before 1.5.0)
-        annotations = [
-            AnalyteAnnotation(**json.loads(zf.read(name)))
-            for name in zf.namelist()
-            if name.startswith('annotations/') and name.endswith('.json')
-        ]
+        # Pre-2026-11 files kept analyte annotations in their own folder
+        if any(name.startswith('annotations/') for name in zf.namelist()):
+            logger.warning(
+                "This project's structure annotations were saved by an older "
+                "format version and are not loaded."
+            )
 
     logger.info(
         f"Loaded {len(samples)} samples, "
         f"{len(alignments)} alignments, "
-        f"{len(assignments)} assignments, "
         f"{len(groups)} groups, "
-        f"{len(annotations)} annotations, "
         f"{len(matrices)} similarity matrices."
     )
 
     return ProjectData(
         samples=samples,
         alignments=alignments,
-        assignments=assignments,
         groups=groups,
         matrices=matrices,
-        annotations=annotations,
     )
 
 
@@ -770,78 +690,31 @@ def deserialize_injection_ensembles(
     ensemble_data: list[dict] = pickle.loads(zf.read(ensembles_path))
 
     for e_dict in ensemble_data:
-        # Reconstruct ion_annots from serialized dicts
-        reconstructed_ion_annots = {}
-        for key, annot_dict in e_dict['ion_annots'].items():
-            # Reconstruct FormulaCandidate
-            formula_data = annot_dict['formula']
-            formula_candidate = FormulaCandidate(
-                formula=Formula(formula_data['formula_str']),
-                error_ppm=formula_data.get('error_ppm'),
-                error_da=formula_data.get('error_da'),
-                rdbe=formula_data.get('rdbe'),
-            )
-
-            # Reconstruct IonAnnotation dataclass
-            ion_annot = IonAnnotation(
-                cofeature_idxs=annot_dict['cofeature_idxs'],
-                ms_level=annot_dict['ms_level'],
-                formula=formula_candidate,
-                uuid=annot_dict['uuid'],
-                user_label=annot_dict.get('user_label'),
-                scan_num=annot_dict.get('scan_num'),
-            )
-            reconstructed_ion_annots[key] = ion_annot
-
-        # Reconstruct ion_pair_annots from serialized dicts
-        reconstructed_ion_pair_annots = []
-        for annot_dict in e_dict['ion_pair_annots']:
-            # Reconstruct Formula from string
-            formula_diff = Formula(annot_dict['formula_diff'])
-
-            # Reconstruct IonPairAnnotation dataclass
-            ion_pair_annot = IonPairAnnotation(
-                ion_a_uuid=annot_dict['ion_a_uuid'],
-                ion_b_uuid=annot_dict['ion_b_uuid'],
-                relationship=annot_dict['relationship'],
-                formula_diff=formula_diff,
-                user_label=annot_dict.get('user_label'),
-            )
-            reconstructed_ion_pair_annots.append(ion_pair_annot)
-
-        # Reconstruct mz_diffs from serialized dicts. `formula` is
-        # optional and absent on pre-formula-bracket .mzk files.
-        reconstructed_mz_diffs = []
-        for mz_diff_dict in e_dict['mz_diffs']:
-            mz_diff_dict = dict(mz_diff_dict)  # don't mutate the source
-            formula_data = mz_diff_dict.get('formula')
-            if formula_data is not None:
-                mz_diff_dict['formula'] = FormulaCandidate(
-                    formula=Formula(formula_data['formula_str']),
-                    error_ppm=formula_data.get('error_ppm'),
-                    error_da=formula_data.get('error_da'),
-                    rdbe=formula_data.get('rdbe'),
-                )
-            else:
-                mz_diff_dict['formula'] = None
-            reconstructed_mz_diffs.append(MzDiffAnnotation(**mz_diff_dict))
-
-        # Reconstruct generic_annots from serialized dicts. Default to
-        # an empty dict for pre-generic-annot .mzk files.
-        reconstructed_generic_annots = {
-            key: GenericAnnotation(**annot_dict)
-            for key, annot_dict in e_dict.get('generic_annots', {}).items()
-        }
-
-        # Instantiate ensemble with reconstructed annotations
         ensemble = Ensemble(
             uuid=e_dict['uuid'],
             ms1_cofeatures=e_dict['ms1_cofeatures'],
             ms2_cofeatures=e_dict['ms2_cofeatures'],
-            mz_diffs=reconstructed_mz_diffs,
-            ion_annots=reconstructed_ion_annots,
-            ion_pair_annots=reconstructed_ion_pair_annots,
-            generic_annots=reconstructed_generic_annots,
+            mz_diffs=[MzDiffAnnotation(**d) for d in e_dict['mz_diffs']],
+            ion_annots={
+                k: IonAnnotation(**d) for k, d in e_dict['ion_annots'].items()
+            },
+            ion_pair_annots=[
+                IonPairAnnotation(**d) for d in e_dict['ion_pair_annots']
+            ],
+            generic_annots={
+                k: _generic_annot(d)
+                for k, d in e_dict['generic_annots'].items()
+                # find-mfs adduct labels now live in adduct_network
+                if d.get('source') != 'auto_adduct'
+            },
+            formula_assignment=deserialize_assignment(
+                e_dict.get('formula_assignment')
+            ),
+            adduct_network=(
+                AdductNetwork(**e_dict['adduct_network'])
+                if e_dict.get('adduct_network') else None
+            ),
+            annotation=EnsembleAnnotation.from_dict(e_dict.get('annotation')),
             # User-editable properties (with defaults for backward compat)
             identity=e_dict.get('identity'),
             user_metadata=e_dict.get('user_metadata', {}),

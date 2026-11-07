@@ -1,50 +1,53 @@
 from core.utils import persistence
+from core.data_structs.ensemble import AdductNetwork
 
-from core.cli.mzml_import import mzml_to_injection
-from core.data_structs import DataRegistry, Sample
-from core.data_structs.scan_array import ScanArrayParameters
+from core.data_structs import DataRegistry
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from core.data_structs import (
-        Injection, Fingerprint,
-    )
 
 logging.basicConfig(
     level=logging.DEBUG
 )
 logger = logging.getLogger(__name__)
 
-mzml_paths = [
-    'test_files/hifan_fractions/20250708_L97117_5_6.mzML',
-    # 'test_files/hifan_fractions/20250708_L97117_5_7.mzML',
-    # 'test_files/hifan_fractions/20250708_L97117_5_8.mzML',
-]
-
-fingerprint_csv_path = 'test_files/L97117_5_1_to_19_biological_response.csv'
-
-
-def test_save_project(
+def test_save_load_project(
     data_registry: DataRegistry,
+    tmp_path,
 ):
+    filepath = tmp_path / 'test_project.mzk'
     persistence.save_project(
-        filepath=Path('test_project.mzk'),
+        filepath=filepath,
         data_registry=data_registry
     )
+    samples = persistence.load_project(filepath=filepath).samples
+
+    # Check if loaded and saved samples are indeed the same
+    sample_uuids_original = data_registry.get_all_sample_uuids()
+    sample_uuids_loaded = [ x.uuid for x in samples ]
+
+    assert sample_uuids_loaded == sample_uuids_original
 
 
-def test_formula_assignment_roundtrip(tmp_path):
-    """A FormulaAssignment must survive save/load with every score term intact
-    (unlike the lossy FormulaCandidate annotation format)."""
+def _reloaded(data_registry, sample, ensemble, tmp_path):
+    """`ensemble` as it comes back from a save/load of `data_registry`."""
+    path = tmp_path / 'reloaded.mzk'
+    persistence.save_project(filepath=path, data_registry=data_registry)
+    return next(
+        s for s in persistence.load_project(filepath=path).samples
+        if s.uuid == sample.uuid
+    ).injection.ensembles[ensemble.uuid]
+
+
+def test_formula_assignment_roundtrip(data_registry, sample, ensemble, tmp_path):
+    """An ensemble's FormulaAssignment must survive save/load with every score
+    term intact."""
     from core.data_structs.formula_assignment import (
         FormulaAssignment, AssignedCandidate,
     )
 
-    reg = DataRegistry()
     assignment = FormulaAssignment(
-        source_uuid=999,
+        source_uuid=ensemble.uuid,
         candidates=[
             AssignedCandidate(
                 formula_str="C12H15Cl2NO5S", adduct="H",
@@ -66,17 +69,19 @@ def test_formula_assignment_roundtrip(tmp_path):
         elements="CHNOSClBr", max_counts="C*H*N*O*S2Cl4Br4", min_counts=None,
         halogen_detected=True,
         params={"max_counts": "C*H*N*O*P0S2", "halogen_cap": "Cl4Br4"},
+        envelope=[0, 2], scan_num=7, M=355.0053,
     )
-    reg.register_assignment(assignment)
+    network = AdductNetwork(
+        M=355.0053, base_envelope=[0, 2], ions={0: '[M+H]+', 3: '[M+Na]+'},
+        near_tie_adducts=[('H', 1), (None, 1)],
+    )
+    data_registry.update_ensemble(
+        ensemble.uuid, formula_assignment=assignment, adduct_network=network,
+    )
 
-    path = tmp_path / "roundtrip.mzk"
-    persistence.save_project(filepath=path, data_registry=reg)
-    assignments = persistence.load_project(filepath=path).assignments
-
-    assert len(assignments) == 1
-    loaded = assignments[0]
-    assert loaded.uuid == assignment.uuid
-    assert loaded.source_uuid == 999
+    loaded = _reloaded(data_registry, sample, ensemble, tmp_path).formula_assignment
+    assert loaded == assignment
+    assert loaded.source_uuid == ensemble.uuid
     assert loaded.chosen_idx == 0
     assert loaded.chosen_by == "user" and loaded.user_chosen
     assert loaded.halogen_detected is True
@@ -88,6 +93,10 @@ def test_formula_assignment_roundtrip(tmp_path):
 
     assert len(loaded.candidates) == 2
     assert loaded.candidates[1].manual and loaded.candidates[1].error_ppm is None
+    assert loaded.envelope == [0, 2] and loaded.scan_num == 7
+
+    loaded_net = _reloaded(data_registry, sample, ensemble, tmp_path).adduct_network
+    assert loaded_net == network and loaded_net.base_ion == '[M+H]+'
     assert not loaded.candidates[0].manual
     c = loaded.candidates[0]
     assert c.formula_str == "C12H15Cl2NO5S"
@@ -96,17 +105,17 @@ def test_formula_assignment_roundtrip(tmp_path):
     assert c.chem_logprior == -3.3
 
 
-def test_analyte_group_roundtrip(tmp_path):
-    """AnalyteGroups (incl. overlapping ones) survive save/load field by field."""
-    from core.data_structs import AnalyteGroup
+def test_ensemble_group_roundtrip(tmp_path):
+    """EnsembleGroups (incl. overlapping ones) survive save/load field by field."""
+    from core.data_structs import EnsembleGroup
 
     reg = DataRegistry()
-    big = AnalyteGroup(
-        analyte_uuids=[3, 1, 2], title="Psammaplins", notes="bromotyrosines",
+    big = EnsembleGroup(
+        ensemble_uuids=[3, 2**120, 2], title="Psammaplins", notes="bromotyrosines",
         smiles="C1=CC=CC=C1", created_at=1760000000.0,
         provenance={"alignment_uuid": 42, "params": {"linkage_method": "average"}},
     )
-    small = AnalyteGroup(analyte_uuids=[2], notes="overlaps big")
+    small = EnsembleGroup(ensemble_uuids=[2], notes="overlaps big")
     reg.register_group(big)
     reg.register_group(small)
 
@@ -117,22 +126,21 @@ def test_analyte_group_roundtrip(tmp_path):
     assert sorted(groups, key=lambda g: g.created_at) == [big, small]
 
 
-def test_analyte_annotation_roundtrip(tmp_path):
-    from core.data_structs import AnalyteAnnotation
+def test_ensemble_structure_annotation_roundtrip(data_registry, sample, ensemble, tmp_path):
+    from core.data_structs.ensemble import EnsembleAnnotation, Hypothesis
 
-    reg = DataRegistry()
-    named = AnalyteAnnotation(analyte_uuid=7, name="Psammaplin A", smiles="CCO")
-    reg.register_annotation(named)
-    reg.register_annotation(AnalyteAnnotation(analyte_uuid=8, name="unknown 1"))
+    annotation = EnsembleAnnotation(
+        name="Psammaplin A", notes="from the sponge",
+        hypotheses=(
+            Hypothesis("CCO", "ethanol", origin="NPAtlas", db_id="NPA1",
+                       scores={"explained": "7/10", "cosine": 0.61}),
+            Hypothesis("CCCO"),
+        ),
+        chosen_idx=1,
+    )
+    data_registry.update_ensemble(ensemble.uuid, annotation=annotation)
 
-    path = tmp_path / "annotations.mzk"
-    persistence.save_project(filepath=path, data_registry=reg)
-    loaded = persistence.load_project(filepath=path).annotations
-
-    assert sorted(loaded, key=lambda x: x.analyte_uuid) == [
-        named, AnalyteAnnotation(analyte_uuid=8, name="unknown 1"),
-    ]
-
+    assert _reloaded(data_registry, sample, ensemble, tmp_path).annotation == annotation
 
 def test_pre_1_4_file_has_no_groups(tmp_path):
     """Files saved before 1.4.0 have no groups/ entries; they load as []."""
@@ -148,29 +156,6 @@ def test_pre_1_4_file_has_no_groups(tmp_path):
     data = persistence.load_project(filepath=path)
     assert data.groups == []
     assert data.matrices == []
-    assert data.annotations == []
-
-
-def test_pre_1_2_assignment_is_skipped_not_fatal(tmp_path, caplog):
-    """Assignments saved before 1.2.0 (element-set provenance fields) aren't
-    migrated; loading skips them with a warning and keeps the rest."""
-    import json
-    import zipfile
-
-    path = tmp_path / "old.mzk"
-    persistence.save_project(filepath=path, data_registry=DataRegistry())
-    old = {
-        "source_uuid": 1, "candidates": [], "uuid": 2, "chosen_idx": None,
-        "elements": "CHNOPS", "autodetect_cl_br": True, "error_ppm": 5.0,
-    }
-    with zipfile.ZipFile(path, mode="a") as zf:
-        zf.writestr("assignments/2.json", json.dumps(old))
-
-    with caplog.at_level(logging.WARNING):
-        assignments = persistence.load_project(filepath=path).assignments
-
-    assert assignments == []
-    assert "older format version" in caplog.text
 
 
 def test_alignment_analyte_uuid_roundtrip(tmp_path):
@@ -195,69 +180,29 @@ def test_alignment_analyte_uuid_roundtrip(tmp_path):
     assert loaded.ensemble_map == {1: 11, 2: 22}
 
 
-def test_load_project(
-    data_registry: DataRegistry,
-):
-    samples = persistence.load_project(
-        filepath=Path('test_project.mzk')
-    ).samples
+def test_ensemble_annotation_roundtrip(data_registry, sample, ensemble, tmp_path):
+    from find_mfs import FormulaCandidate
+    from molmass import Formula
 
-    # Check if loaded and saved samples are indeed the same
-    sample_uuids_original = data_registry.get_all_sample_uuids()
-    sample_uuids_loaded = [ x.uuid for x in samples ]
+    ens = ensemble
+    a = ens.add_ion_annot([0], 1, FormulaCandidate(
+        Formula('C15H23NO4'), 1.2, 0.0003, 5.0, adduct='Na'), label='')
+    b = ens.add_ion_annot([0], 1, FormulaCandidate(
+        Formula('C15H21NO3'), -0.4, 0.0001, 6.0), label='x', scan_num=3)
+    ens.add_ion_pair_annot(a.uuid, b.uuid, 'neutral_loss')
+    ens.add_mz_diff_annot(0, 0, 1, 18.0106, formula='H2O')
+    ens.add_generic_annot([0], 1, 'hello')
+    assert ens.ion_pair_annots[0].formula_diff == 'H2O'
+    assert a.isotope_envelope.size  # adduct path still builds an ion formula
 
-    assert sample_uuids_loaded == sample_uuids_original
+    loaded = _reloaded(data_registry, sample, ens, tmp_path)
+
+    for field in ('mz_diffs', 'ion_annots', 'ion_pair_annots', 'generic_annots'):
+        assert getattr(loaded, field) == getattr(ens, field)
 
 
-def test_populate_data_registry(
-) -> DataRegistry:
-    """
-    Populates a DataRegistry using test files
-    :return:
-    """
-    import pytest
-    missing = [p for p in mzml_paths if not Path(p).exists()]
-    if missing:
-        pytest.skip(
-            f"test data not present (e.g. {missing[0]}); mzML is gitignored"
-        )
-
-    data_registry = DataRegistry()
-
-    scan_array_params = ScanArrayParameters(
-        ms_level=1,
-        mz_tolerance=0.03,
-        scan_gap_tolerance=3,
-        min_intsy=3000,
-        scan_nums=None,
+def test_old_generic_annotation_loads_as_multi_peak():
+    a = persistence._generic_annot(
+        {'cofeature_idx': 3, 'ms_level': 1, 'text': 'x', 'uuid': 1, 'source': 'user'}
     )
-
-    for mzml_path in mzml_paths:
-        injection: 'Injection' = mzml_to_injection(
-            input_filepath=Path(mzml_path),
-            scan_array_params=( scan_array_params, scan_array_params),
-            verbose=True,
-        )
-
-        sample = Sample(
-            name="Test Sample",
-            injection=injection,
-        )
-
-        data_registry.register_sample(
-            sample
-        )
-
-    return data_registry
-
-
-if __name__ == "__main__":
-    data_registry = test_populate_data_registry()
-
-    test_save_project(data_registry)
-    test_load_project(data_registry)
-
-
-
-
-
+    assert a.cofeature_idxs == [3] and a.text == 'x'

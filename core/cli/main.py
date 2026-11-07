@@ -54,14 +54,10 @@ def _load_registry(*mzk_paths: Path) -> DataRegistry:
         registry.register_samples(data.samples)
         for alignment in data.alignments:
             registry.register_alignment(alignment)
-        for assignment in data.assignments:
-            registry.register_assignment(assignment)
         for group in data.groups:
             registry.register_group(group)
         for matrix in data.matrices:
             registry.register_matrix(matrix)
-        for annotation in data.annotations:
-            registry.register_annotation(annotation)
     return registry
 
 
@@ -341,9 +337,6 @@ def cmd_align(args: argparse.Namespace) -> None:
         rt_tolerance=args.rt_tolerance,
         mz_tolerance=args.mz_tolerance,
         ms1_similarity_threshold=args.ms1_threshold,
-        ms2_similarity_threshold=args.ms2_threshold,
-        ms1_weight=args.ms1_weight,
-        ms2_weight=args.ms2_weight,
     )
 
     n_ens = sum(len(s.injection.ensembles) for s in samples)
@@ -402,9 +395,6 @@ def cmd_merge_alignments(args: argparse.Namespace) -> None:
         rt_tolerance=args.rt_tolerance,
         mz_tolerance=args.mz_tolerance,
         ms1_similarity_threshold=args.ms1_threshold,
-        ms2_similarity_threshold=args.ms2_threshold,
-        ms1_weight=args.ms1_weight,
-        ms2_weight=args.ms2_weight,
     )
 
     samples = registry.get_all_samples()
@@ -465,7 +455,7 @@ def cmd_auto_extract(args: argparse.Namespace) -> None:
             logger.info(f"Skipping '{sample.name}' (no MS1 data)")
             continue
         if args.replace:
-            injection.remove_all_ensembles()
+            registry.remove_ensembles(list(injection.ensembles))
         ensembles = auto_generate_ensembles(injection, params)
         processed += 1
         total += len(ensembles)
@@ -531,10 +521,12 @@ def cmd_auto_find_mfs(args: argparse.Namespace) -> None:
         params=params,
         selection=selection,
         keep=registry.user_chosen_sources(),
-        attach_adduct_labels=not args.no_adduct_labels,
     )
     for assignment in result.assignments:
-        registry.register_assignment(assignment)
+        registry.update_ensemble(
+            assignment.source_uuid, formula_assignment=assignment,
+            adduct_network=result.networks.get(assignment.source_uuid),
+        )
 
     output = _resolve_output(args, mzk_path)
     save_project(output, registry)
@@ -647,7 +639,7 @@ def cmd_export_table(args: argparse.Namespace) -> None:
         write_mgf=args.mgf,
         mgf_mode='per_sample' if args.mgf_mode == 'per-sample' else 'consensus',
         formulas=registry.chosen_formulas(),
-        groups=registry.group_titles(),
+        groups=registry.group_titles(alignment),
         write_graphml=args.graphml,
         min_edge_score=args.min_edge_cosine,
         network_params=network_params,
@@ -693,6 +685,17 @@ def cmd_export_compound(args: argparse.Namespace) -> None:
             normalize=normalize,
             formulas=registry.chosen_formulas(),
         )
+
+
+def cmd_build_spectral_db(args: argparse.Namespace) -> None:
+    from core.utils import spectrum_db
+
+    path = spectrum_db.build_db(
+        Path(args.mgf_dir), Path(args.output),
+        progress_callback=lambda pct, msg: print(f"[{pct:5.1f}%] {msg}", flush=True),
+    )
+    print(f"Built {path}: {', '.join(spectrum_db.available_libraries(path))}; "
+          f"embeddings: {', '.join(spectrum_db.embedders(path)) or 'none'}")
 
 
 def cmd_import_similarity(args: argparse.Namespace) -> None:
@@ -1048,10 +1051,6 @@ def build_parser() -> argparse.ArgumentParser:
         help='Only annotate ensembles whose base-peak intensity is at least '
              'this (default: no floor)',
     )
-    p_find_mf.add_argument(
-        '--no-adduct-labels', action='store_true', default=False,
-        help='Do not attach adduct labels to MS1 signals',
-    )
     p_find_mf.set_defaults(func=cmd_auto_find_mfs)
 
     # --- align ---
@@ -1084,12 +1083,6 @@ def build_parser() -> argparse.ArgumentParser:
                          help='m/z tolerance for peak pairing (default: 0.01)')
     p_align.add_argument('--ms1-threshold', type=float, default=0.7,
                          help='Min MS1 cosine similarity (default: 0.7)')
-    p_align.add_argument('--ms2-threshold', type=float, default=0.6,
-                         help='Min MS2 cosine similarity (default: 0.6)')
-    p_align.add_argument('--ms1-weight', type=float, default=0.5,
-                         help='Weight of MS1 similarity in score (default: 0.5)')
-    p_align.add_argument('--ms2-weight', type=float, default=0.5,
-                         help='Weight of MS2 similarity in score (default: 0.5)')
     p_align.set_defaults(func=cmd_align)
 
     # --- merge-alignments ---
@@ -1128,12 +1121,6 @@ def build_parser() -> argparse.ArgumentParser:
                          help='m/z tolerance for peak pairing (default: 0.01)')
     p_merge.add_argument('--ms1-threshold', type=float, default=0.7,
                          help='Min MS1 cosine similarity (default: 0.7)')
-    p_merge.add_argument('--ms2-threshold', type=float, default=0.6,
-                         help='Min MS2 cosine similarity (default: 0.6)')
-    p_merge.add_argument('--ms1-weight', type=float, default=0.5,
-                         help='Weight of MS1 similarity in score (default: 0.5)')
-    p_merge.add_argument('--ms2-weight', type=float, default=0.5,
-                         help='Weight of MS2 similarity in score (default: 0.5)')
     p_merge.set_defaults(func=cmd_merge_alignments)
 
     # --- filter ---
@@ -1328,6 +1315,22 @@ def build_parser() -> argparse.ArgumentParser:
         help='Output .mzk file (default: modify input in place)',
     )
     p_sim.set_defaults(func=cmd_import_similarity)
+
+    # --- build-spectral-db ---
+    from core.utils.spectrum_db import DB_DIR, DEFAULT_DB
+    p_specdb = subparsers.add_parser(
+        'build-spectral-db',
+        help='(Re)build the spectral library index (+ embeddings) from a folder of .mgf files',
+    )
+    p_specdb.add_argument(
+        '--mgf-dir', default=str(DB_DIR),
+        help=f'Folder of <library>.mgf (and <library>.<embedder>.npz) files (default: {DB_DIR})',
+    )
+    p_specdb.add_argument(
+        '-o', '--output', default=str(DEFAULT_DB),
+        help=f'Index to write (default: {DEFAULT_DB})',
+    )
+    p_specdb.set_defaults(func=cmd_build_spectral_db)
 
     return parser
 

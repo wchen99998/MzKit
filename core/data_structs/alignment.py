@@ -59,18 +59,13 @@ class AlignmentParams(NamedTuple):
         when computing spectral cosine similarity.
     ms1_similarity_threshold: Minimum MS1 cosine similarity
         to consider a match.
-    ms2_similarity_threshold: Minimum MS2 cosine similarity
-        to consider a match (only used when both ensembles
-        have MS2 data).
-    ms1_weight: Weight for MS1 similarity in combined score.
-    ms2_weight: Weight for MS2 similarity in combined score.
+
+    Alignment is MS1 + RT only: it's an identity claim that annotations
+    (MS2-derived or otherwise) can't move.
     """
     rt_tolerance: float = 10.0
     mz_tolerance: float = 0.01
     ms1_similarity_threshold: float = 0.7
-    ms2_similarity_threshold: float = 0.6
-    ms1_weight: float = 0.5
-    ms2_weight: float = 0.5
 
 
 @dataclass
@@ -138,8 +133,8 @@ class AlignedAnalyte:
             by sample uuid (members that can't be resolved may be omitted).
         :return: None when no member ensemble is given.
 
-        Cached; the analyte's membership is immutable, so the cache never
-        goes stale.
+        Cached (membership is immutable); DataRegistry resets it when a DDA
+        member's representative MS2 moves to another precursor.
         """
         if self._representative is not None:
             return self._representative

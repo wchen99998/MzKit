@@ -68,6 +68,8 @@ class MainController:
             data_registry=self.data_registry,
         )
         self.subwindow_manager.initialize_all_windows()
+        # Tools > Libraries & databases, created on first use
+        self._libraries_dialog = None
 
         # Connect QSignals
         self.process_controller.model.sigProcessUpdated.connect(
@@ -154,6 +156,9 @@ class MainController:
         )
         self.main_view.sigCompoundDbRequested.connect(
             self._handle_compound_db_request
+        )
+        self.main_view.sigLibrariesRequested.connect(
+            self._handle_libraries_request
         )
 
         self._connect_window_menu()
@@ -303,9 +308,13 @@ class MainController:
         alignment_viewer.sigAutoFindMfsRequested.connect(
             self._handle_auto_find_mf_batch_request
         )
+        alignment_viewer.sigApplyFormulaRequested.connect(
+            self._handle_apply_formula_request
+        )
         alignment_viewer.sigClusterRequested.connect(
             self._handle_cluster_analytes_request
         )
+        self._connect_annotation_tabs(alignment_viewer)
 
     def _connect_ensemble_viewer_signals(self) -> None:
         """
@@ -320,6 +329,17 @@ class MainController:
 
         ensemble_viewer.sigAutoFindMfRequested.connect(
             self._handle_auto_find_mf_request
+        )
+        self._connect_annotation_tabs(ensemble_viewer)
+
+    def _connect_annotation_tabs(self, viewer) -> None:
+        """A viewer hosting AnnotationTabs: its searches run here, results go back to its tabs."""
+        tabs = viewer.annotation_tabs
+        viewer.sigRankCandidatesRequested.connect(
+            lambda key, kwargs: self._handle_rank_candidates_request(tabs, key, kwargs)
+        )
+        viewer.sigSpectralSearchRequested.connect(
+            lambda slot, kwargs: self._handle_spectral_search_request(tabs, slot, kwargs)
         )
 
     def _handle_add_samples_request(
@@ -675,7 +695,7 @@ class MainController:
                 "output": path,
                 "separator": separator,
                 "formulas": self.data_registry.chosen_formulas(),
-                "groups": self.data_registry.group_titles(),
+                "groups": self.data_registry.group_titles(alignment),
                 "network_params": network_params,
                 "matrix": matrix,
                 "analyte_linkage": analyte_linkage,
@@ -917,14 +937,10 @@ class MainController:
         self.data_registry.register_samples(result.samples)
         for alignment in result.alignments:
             self.data_registry.register_alignment(alignment)
-        for assignment in result.assignments:
-            self.data_registry.register_assignment(assignment)
         for group in result.groups:
             self.data_registry.register_group(group)
         for matrix in result.matrices:
             self.data_registry.register_matrix(matrix)
-        for annotation in result.annotations:
-            self.data_registry.register_annotation(annotation)
 
     def _handle_generate_ensemble_request(
         self,
@@ -1046,6 +1062,62 @@ class MainController:
             ),
         )
 
+    def _handle_rank_candidates_request(self, tabs, key, kwargs: dict):
+        """Rank a target's database candidates by GLACIER in the background
+        (a viewer's AnnotationTabs); the result goes back to `tabs` under `key`."""
+        self.process_controller.start_process(
+            module_path="core.cli.rank_candidates",
+            function_name="rank_candidates",
+            parameters=kwargs,
+            on_completion_func=lambda result: tabs.set_ranking(key, result),
+        )
+
+    def _handle_spectral_search_request(self, tabs, slot, kwargs: dict):
+        """Search the spectral libraries for a target's MS2 in the background
+        (a viewer's AnnotationTabs); the result goes back to `tabs` under `slot`."""
+        self.process_controller.start_process(
+            module_path="core.cli.search_spectra",
+            function_name="search_spectra",
+            parameters=kwargs,
+            on_completion_func=lambda result: tabs.set_spectral_result(slot, result),
+        )
+
+    def _handle_libraries_request(self) -> None:
+        """Tools > Libraries & databases (one dialog, kept)."""
+        if self._libraries_dialog is None:
+            from gui.dialogues.LibrariesDialog import LibrariesDialog
+            dialog = self._libraries_dialog = LibrariesDialog(parent=self.main_view)
+            dialog.sigRebuildSpectral.connect(
+                lambda: self._run_index_build("core.utils.spectrum_db", "refresh_index")
+            )
+            dialog.sigBuildCompounds.connect(
+                lambda: self._run_index_build("core.utils.compound_db", "refresh_sources")
+            )
+            dialog.sigEmbeddingsImported.connect(lambda _: self._refresh_annotation_tabs("refresh_modes"))
+        self._libraries_dialog.refresh()
+        self._libraries_dialog.show()
+        self._libraries_dialog.raise_()
+
+    def _run_index_build(self, module_path: str, refresh: str) -> None:
+        """Build an index (`module_path`.build_db) in the background; then every
+        viewer's annotation tabs `refresh` and the dialog shows the new state."""
+        def done(result):
+            self._refresh_annotation_tabs(refresh)
+            if self._libraries_dialog is not None:
+                self._libraries_dialog.build_done(bool(result))
+
+        self.process_controller.start_process(
+            module_path=module_path,
+            function_name="build_db",
+            on_completion_func=done,
+        )
+
+    def _refresh_annotation_tabs(self, method: str) -> None:
+        for name in ('alignment_viewer', 'ensemble_viewer'):
+            viewer = self.subwindow_manager.get_window(name)
+            if viewer is not None:
+                getattr(viewer.annotation_tabs, method)()
+
     def _handle_cluster_analytes_request(
         self,
         alignment,       # EnsembleAlignment
@@ -1154,6 +1226,38 @@ class MainController:
             on_completion_func=self._on_auto_find_mf_complete,
         )
 
+    def _handle_apply_formula_request(self, source, members: list, tol_da: float):
+        """
+        An ensemble's formula + ion, searched for again on its aligned
+        members (Alignment Viewer); each result is set on its member.
+        """
+        from core.formula.params import FindMfsParams
+
+        def done(result):
+            if result is None:
+                self.main_view.statusbar.showMessage(
+                    "Applying the formula failed; see the Process Monitor for details"
+                )
+                return
+            for uuid, assignment, network in result.updates:
+                if self.data_registry.get_ensemble(uuid) is not None:  # not removed meanwhile
+                    self.data_registry.update_ensemble(
+                        uuid, formula_assignment=assignment, adduct_network=network,
+                    )
+            self.main_view.statusbar.showMessage(result.summary())
+
+        self.process_controller.start_process(
+            module_path="core.formula.bulk",
+            function_name="apply_formula_to_members",
+            parameters={
+                "source": source,
+                "members": members,
+                "tol_da": tol_da,
+                "params": FindMfsParams.from_config(self.config),
+            },
+            on_completion_func=done,
+        )
+
     def _handle_formula_batch_request(
         self,
         kind: str,
@@ -1186,8 +1290,7 @@ class MainController:
             return
 
         assigned = [
-            u for u in ensembles
-            if self.data_registry.get_assignment_for_source(u) is not None
+            u for u, e in ensembles.items() if e.formula_assignment is not None
         ]
         if not assigned:
             self.main_view.statusbar.showMessage("No formula assignments to remove")
@@ -1202,7 +1305,7 @@ class MainController:
         if answer != QMessageBox.Yes:
             return
         for uuid in assigned:
-            self.data_registry.remove_assignment(uuid)
+            self.data_registry.update_ensemble(uuid, formula_assignment=None)
         self.main_view.statusbar.showMessage(
             f"Removed {n} formula assignment{'' if n == 1 else 's'}"
         )
@@ -1213,10 +1316,9 @@ class MainController:
         protect_user_choices: bool = True,
     ):
         """
-        Register each assignment. sigAssignmentAdded then drives the Ensemble
-        Viewer's title-strip + adduct-label refresh and the Sample Viewer's
-        overlay label. (Adduct annotations were already attached to the
-        ensemble in the worker.) The run's summary, including what was skipped
+        Set each assignment and adduct network on its ensemble.
+        sigEnsembleAnnotated then drives the Ensemble Viewer's title-strip +
+        ion-label refresh and the Sample Viewer's overlay label. The run's summary, including what was skipped
         and why, goes to the status bar.
 
         With `protect_user_choices`, an ensemble whose formula the user chose
@@ -1230,13 +1332,17 @@ class MainController:
             return
         registered = []
         for assignment in result.assignments:
-            existing = self.data_registry.get_assignment_for_source(
-                assignment.source_uuid
-            )
+            ensemble = self.data_registry.get_ensemble(assignment.source_uuid)
+            if ensemble is None:  # its sample was removed during the run
+                continue
+            existing = ensemble.formula_assignment
             if protect_user_choices and existing is not None and existing.user_chosen:
                 result.n_user_chosen += 1
                 continue
-            self.data_registry.register_assignment(assignment)
+            self.data_registry.update_ensemble(
+                ensemble.uuid, formula_assignment=assignment,
+                adduct_network=result.networks.get(ensemble.uuid),
+            )
             registered.append(assignment)
         result.assignments = registered
         self.main_view.statusbar.showMessage(f"find-mfs: {result.summary()}")
